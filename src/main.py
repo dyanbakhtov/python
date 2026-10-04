@@ -1,16 +1,39 @@
-# This is a sample Python script.
+import logging
+from decimal import Decimal
 
-# Press ⌃R to execute it or replace it with your code.
-# Press Double ⇧ to search everywhere for classes, files, tool windows, actions, and settings.
+from exceptions import BankAccountError
+from models import Client, BankAccount, AccountStatus, Currency
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
 
-def print_hi(name):
-    # Use a breakpoint in the code line below to debug your script.
-    print(f'Hi, {name}')  # Press ⌘F8 to toggle the breakpoint.
+if __name__ == "__main__":
+    test_client = Client("Семён Персунов")
 
+    # ➕ создание активного и замороженного счёта
+    active_account = BankAccount(
+        client=test_client,
+        balance=Decimal("1000.00"),
+        account_status=AccountStatus.ACTIVE,
+        currency=Currency.RUB
+    )
 
-# Press the green button in the gutter to run the script.
-if __name__ == '__main__':
-    print_hi('PyCharm')
+    frozen_account = BankAccount(
+        client=test_client,
+        balance=Decimal("5000.00"),
+        account_status=AccountStatus.FROZEN,
+        currency=Currency.USD
+    )
 
-# See PyCharm help at https://www.jetbrains.com/help/pycharm/
+    # 🚫 попытка операций над замороженным счётом
+    try:
+        frozen_account.deposit(Decimal("5000.00"))
+    except BankAccountError as e:
+        print(f"{e.__class__.__name__}: {e}")
+
+    # ✅ валидное пополнение и снятие
+    active_account.withdraw(Decimal("300.00"))
+    active_account.deposit(Decimal("500.00"))
