@@ -40,7 +40,7 @@ class AbstractAccount(ABC):
             account_status: AccountStatus
     ) -> None:
         if not isinstance(client, Client):
-            raise InvalidOperationError(f"Invalid client: {client}. Expected Client enum, got {type(client).__name__}")
+            raise InvalidOperationError(f"Invalid client: {client}. Expected Client, got {type(client).__name__}")
         if not isinstance(account_status, AccountStatus):
             raise InvalidOperationError(f"Invalid account status: {account_status}. Expected AccountStatus enum, got {type(account_status).__name__}")
 
@@ -70,7 +70,7 @@ class AbstractAccount(ABC):
             raise InvalidOperationError(f"Operation prohibited: account status is {self.account_status.name}")
 
     @staticmethod
-    def _validate_money_amount(amount: Decimal, param_name: str = "Amount", allow_zero: bool = False) -> Decimal:
+    def _validate_money_amount(amount: Decimal, param_name: str = "Amount", allow_zero: bool = False) -> None:
         if not isinstance(amount, Decimal):
             raise InvalidOperationError(f"{param_name} must be a Decimal, got {type(amount).__name__}")
         if not amount.is_finite():
@@ -78,12 +78,10 @@ class AbstractAccount(ABC):
 
         if allow_zero:
             if amount < Decimal(0):
-                raise InvalidOperationError(f"{param_name} cannot be negative")
+                raise InvalidOperationError(f"{param_name} cannot be negative, got {amount}")
         else:
             if amount <= Decimal(0):
-                raise InvalidOperationError(f"{param_name} must be positive")
-
-        return amount
+                raise InvalidOperationError(f"{param_name} must be positive, got {amount}")
 
 
 class Currency(Enum):
@@ -103,9 +101,6 @@ class BankAccount(AbstractAccount):
             currency: Currency,
             account_id: Optional[str] = None
     ) -> None:
-        if (account_id is not None) & isinstance(account_id, str):
-            raise InvalidOperationError(f"Invalid account_id: {account_id}. Expected str type, got {type(account_id).__name__}")
-
         if not isinstance(currency, Currency):
             raise InvalidOperationError(f"Invalid currency: {currency}. Expected Currency enum, got {type(currency).__name__}")
 
@@ -119,25 +114,25 @@ class BankAccount(AbstractAccount):
 
     def deposit(self, amount: Decimal) -> None:
         self._validate_status()
-        valid_amount = self._validate_money_amount(amount, param_name="Deposit amount")
-        self._balance += valid_amount
+        self._validate_money_amount(amount, param_name="Deposit amount")
+        self._balance += amount
         logger.info(
             "Deposit successful: Account=%s, Amount=+%s %s, New Balance=%s %s",
-            self.account_id, valid_amount, self.currency.value, self._balance, self.currency.value
+            self.account_id, amount, self.currency.value, self._balance, self.currency.value
         )
 
     def withdraw(self, amount: Decimal) -> None:
         self._validate_status()
-        valid_amount = self._validate_money_amount(amount, param_name="Withdrawal amount")
+        self._validate_money_amount(amount, param_name="Withdrawal amount")
 
-        if self._balance < valid_amount:
+        if self._balance < amount:
             raise InsufficientFundsError(
                 f"Operation prohibited: insufficient balance {self._balance} {self.currency.value}")
 
-        self._balance -= valid_amount
+        self._balance -= amount
         logger.info(
             "Withdrawal successful: Account=%s, Amount=-%s %s, New Balance=%s %s",
-            self.account_id, valid_amount, self.currency.value, self._balance, self.currency.value
+            self.account_id, amount, self.currency.value, self._balance, self.currency.value
         )
 
     def get_account_info(self) -> str:

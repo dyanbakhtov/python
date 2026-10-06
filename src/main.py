@@ -10,6 +10,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 
+logger = logging.getLogger(__name__)
+
 if __name__ == "__main__":
     test_client = Client("Семён Персунов")
 
@@ -32,7 +34,7 @@ if __name__ == "__main__":
     try:
         frozen_account.deposit(Decimal("5000.00"))
     except BankAccountError as e:
-        print(f"{e.__class__.__name__}: {e}")
+        logger.warning(f"{e.__class__.__name__}: {e}")
 
     # ✅ валидное пополнение и снятие
     active_account.withdraw(Decimal("300.00"))
