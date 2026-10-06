@@ -3,7 +3,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
-from enum import auto
 from typing import Optional
 
 from exceptions import (
@@ -27,9 +26,9 @@ class Client:
 
 
 class AccountStatus(Enum):
-    ACTIVE = auto()
-    FROZEN = auto()
-    CLOSED = auto()
+    ACTIVE = "ACTIVE"
+    FROZEN = "FROZEN"
+    CLOSED = "CLOSED"
 
 
 class AbstractAccount(ABC):
@@ -40,6 +39,11 @@ class AbstractAccount(ABC):
             balance: Decimal,
             account_status: AccountStatus
     ) -> None:
+        if not isinstance(client, Client):
+            raise InvalidOperationError(f"Invalid client: {client}. Expected Client, got {type(client).__name__}")
+        if not isinstance(account_status, AccountStatus):
+            raise InvalidOperationError(f"Invalid account status: {account_status}. Expected AccountStatus enum, got {type(account_status).__name__}")
+
         self.account_id = account_id
         self.client = client
         self._balance = balance
@@ -56,6 +60,28 @@ class AbstractAccount(ABC):
     @abstractmethod
     def get_account_info(self) -> str:
         pass
+
+    def _validate_status(self) -> None:
+        if self.account_status == AccountStatus.FROZEN:
+            raise AccountFrozenError("Operation prohibited: account is frozen")
+        if self.account_status == AccountStatus.CLOSED:
+            raise AccountClosedError("Operation prohibited: account is closed")
+        if self.account_status != AccountStatus.ACTIVE:
+            raise InvalidOperationError(f"Operation prohibited: account status is {self.account_status.name}")
+
+    @staticmethod
+    def _validate_money_amount(amount: Decimal, param_name: str = "Amount", allow_zero: bool = False) -> None:
+        if not isinstance(amount, Decimal):
+            raise InvalidOperationError(f"{param_name} must be a Decimal, got {type(amount).__name__}")
+        if not amount.is_finite():
+            raise InvalidOperationError(f"{param_name} must be finite number, got {amount}")
+
+        if allow_zero:
+            if amount < Decimal(0):
+                raise InvalidOperationError(f"{param_name} cannot be negative, got {amount}")
+        else:
+            if amount <= Decimal(0):
+                raise InvalidOperationError(f"{param_name} must be positive, got {amount}")
 
 
 class Currency(Enum):
@@ -75,28 +101,20 @@ class BankAccount(AbstractAccount):
             currency: Currency,
             account_id: Optional[str] = None
     ) -> None:
-        actual_id = account_id if account_id is not None else generate_short_uuid()
+        if not isinstance(currency, Currency):
+            raise InvalidOperationError(f"Invalid currency: {currency}. Expected Currency enum, got {type(currency).__name__}")
 
-        if balance < 0:
-            raise InvalidOperationError("Initial balance cannot be negative")
+        self._validate_money_amount(balance, param_name="Initial balance", allow_zero=True)
+        actual_id = account_id if account_id is not None else generate_short_uuid()
 
         super().__init__(actual_id, client, balance, account_status)
         self.currency = currency
 
         logger.info("Account created. %s", self)
 
-    def _validate_status(self) -> None:
-        if self.account_status == AccountStatus.FROZEN:
-            raise AccountFrozenError("Operation prohibited: account is frozen")
-        if self.account_status == AccountStatus.CLOSED:
-            raise AccountClosedError("Operation prohibited: account is closed")
-        if self.account_status != AccountStatus.ACTIVE:
-            raise InvalidOperationError(f"Operation prohibited: account status is {self.account_status.name}")
-
     def deposit(self, amount: Decimal) -> None:
         self._validate_status()
-        if amount <= 0:
-            raise InvalidOperationError("Operation prohibited: amount must be positive")
+        self._validate_money_amount(amount, param_name="Deposit amount")
         self._balance += amount
         logger.info(
             "Deposit successful: Account=%s, Amount=+%s %s, New Balance=%s %s",
@@ -105,11 +123,12 @@ class BankAccount(AbstractAccount):
 
     def withdraw(self, amount: Decimal) -> None:
         self._validate_status()
-        if amount <= 0:
-            raise InvalidOperationError("Operation prohibited: amount must be positive")
+        self._validate_money_amount(amount, param_name="Withdrawal amount")
+
         if self._balance < amount:
             raise InsufficientFundsError(
                 f"Operation prohibited: insufficient balance {self._balance} {self.currency.value}")
+
         self._balance -= amount
         logger.info(
             "Withdrawal successful: Account=%s, Amount=-%s %s, New Balance=%s %s",
