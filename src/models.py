@@ -97,8 +97,8 @@ class BankAccount(AbstractAccount):
             self,
             client: Client,
             balance: Decimal,
-            account_status: AccountStatus,
             currency: Currency,
+            account_status: AccountStatus,
             account_id: Optional[str] = None
     ) -> None:
         if not isinstance(currency, Currency):
@@ -106,9 +106,8 @@ class BankAccount(AbstractAccount):
 
         self._validate_money_amount(balance, param_name="Initial balance", allow_zero=True)
         actual_id = account_id if account_id is not None else generate_short_uuid()
-
-        super().__init__(actual_id, client, balance, account_status)
         self.currency = currency
+        super().__init__(actual_id, client, balance, account_status)
 
         logger.info("Account created. %s", self)
 
@@ -143,3 +142,44 @@ class BankAccount(AbstractAccount):
             f"Type: {self.__class__.__name__} | Client: {self.client} | Account Number: {self.account_id[-4:]} | "
             f"Status: {self.account_status.name} | Balance: {self._balance} {self.currency.value}"
         )
+
+class SavingsAccount(BankAccount):
+    def __init__(
+            self,
+            client: Client,
+            balance: Decimal,
+            currency: Currency,
+            account_status: AccountStatus,
+            min_balance: Decimal,
+            monthly_rate: Decimal,
+            account_id: Optional[str] = None
+    ) -> None:
+        self._validate_money_amount(min_balance, param_name="Min Balance", allow_zero=True)
+        if balance < min_balance:
+            raise InsufficientFundsError(f"Balance cannot be less than min balance: "
+                                         f"balance= {self._balance} {self.currency.value}, "
+                                         f"min_balance= {min_balance} {self.currency.value}")
+
+        if not isinstance(monthly_rate, Decimal) or monthly_rate <= Decimal(0) or monthly_rate > Decimal(100):
+            raise InvalidOperationError("Invalid monthly rate, must be between 0 and 100")
+
+        self.min_balance = min_balance
+        self.monthly_rate = monthly_rate
+
+        super().__init__(client, balance, currency, account_status, account_id)
+
+    def withdraw(self, amount: Decimal) -> None:
+        if (self._balance - amount) < self.min_balance:
+            raise InsufficientFundsError(f"Operation prohibited: remaining balance would drop below min balance "
+                                         f"({self.min_balance} {self.currency.value})")
+        super().withdraw(amount)
+
+    def apply_monthly_interest(self) -> None:
+        self._validate_status()
+        interest_amount = self._balance * (self.monthly_rate / Decimal(100))
+        self._balance += interest_amount
+        logger.info("Monthly interest applied: Account=%s, Added=%s %s, New Balance =%s %s",
+            self.account_id, interest_amount, self.currency.value, self._balance, self.currency.value)
+
+    def __str__(self) -> str:
+        return super().__str__() + f" | Min Balance: {self.min_balance} | Monthly Rate: {self.monthly_rate} %"

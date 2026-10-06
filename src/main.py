@@ -2,7 +2,7 @@ import logging
 from decimal import Decimal
 
 from exceptions import BankAccountError
-from models import Client, BankAccount, AccountStatus, Currency
+from models import Client, BankAccount, AccountStatus, Currency, SavingsAccount
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,3 +39,7 @@ if __name__ == "__main__":
     # ✅ валидное пополнение и снятие
     active_account.withdraw(Decimal("300.00"))
     active_account.deposit(Decimal("500.00"))
+
+    savings_account = SavingsAccount(test_client, Decimal("500.00"), Currency.RUB, AccountStatus.ACTIVE, Decimal("300.00"), Decimal("10.3"))
+    savings_account.apply_monthly_interest()
+    print(savings_account.get_account_info())
