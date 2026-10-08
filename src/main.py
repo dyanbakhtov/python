@@ -1,9 +1,10 @@
 import logging
+from datetime import date
 from decimal import Decimal
 
 from exceptions import BankAccountError
 from models import Client, BankAccount, AccountStatus, Currency, SavingsAccount, PremiumAccount, InvestmentAccount, \
-    AssetType
+    AssetType, ClientStatus
 
 logging.basicConfig(
     level=logging.INFO,
@@ -14,20 +15,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 if __name__ == "__main__":
-    test_client = Client("Семён Персунов")
+    test_client = Client("Семён Персунов", date(1993, 5, 16), "+71234567890", ClientStatus.ACTIVE)
 
     # ➕ создание активного и замороженного счёта
     active_account = BankAccount(
         client=test_client,
         balance=Decimal("1000.00"),
-        account_status=AccountStatus.ACTIVE,
+        status=AccountStatus.ACTIVE,
         currency=Currency.RUB
     )
 
     frozen_account = BankAccount(
         client=test_client,
         balance=Decimal("5000.00"),
-        account_status=AccountStatus.FROZEN,
+        status=AccountStatus.FROZEN,
         currency=Currency.USD
     )
 

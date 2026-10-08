@@ -2,9 +2,12 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from datetime import date
 from decimal import Decimal, ROUND_HALF_EVEN
 from enum import Enum
 from typing import Optional, Dict
+
+from dateutil.relativedelta import relativedelta
 
 from exceptions import (
     AccountClosedError,
@@ -17,13 +20,47 @@ from utils import generate_short_uuid
 logger = logging.getLogger(__name__)
 
 
+class ClientStatus(Enum):
+    ACTIVE = "ACTIVE"
+    BLOCKED = "BLOCKED"
+
+
 @dataclass
 class Client:
     name: str
+    date_of_birth: date
+    phone_number: str | list[str]
+    status: ClientStatus
+    login_attempts: int = 0
+    accounts: list[BankAccount] = field(default_factory=list)
     client_id: str = field(default_factory=generate_short_uuid)
+    _password: str = field(default_factory=generate_short_uuid)
+
+    @property
+    def age(self) -> int:
+        return relativedelta(date.today(), self.date_of_birth).years
+
+    @property
+    def is_adult(self) -> bool:
+        return self.age >= 18
+
+    @property
+    def password(self) -> str:
+        return self._password
+
+    def fail_login(self) -> None:
+        self.login_attempts += 1
+
+    def reset_login_attempts(self) -> None:
+        self.login_attempts = 0
+
+    def __post_init__(self) -> None:
+        if not self.is_adult:
+            raise InvalidOperationError(f"Client initialization failed: client {self.client_id[-4:]} {self.name}"
+                                        f" is not adult (current age: {self.age})")
 
     def __str__(self) -> str:
-        return f"{self.client_id[-4:]} {self.name}"
+        return f"{self.client_id[-4:]} {self.name}, {self.date_of_birth}, {self.phone_number}, {self.status.value}"
 
 
 class AccountStatus(Enum):
@@ -38,18 +75,20 @@ class AbstractAccount(ABC):
             account_id: str,
             client: Client,
             balance: Decimal,
-            account_status: AccountStatus
+            status: AccountStatus
     ) -> None:
-        if not isinstance(client, Client):
-            raise InvalidOperationError(f"Invalid client: {client}. Expected Client, got {type(client).__name__}")
-        if not isinstance(account_status, AccountStatus):
+        if not isinstance(status, AccountStatus):
             raise InvalidOperationError(
-                f"Invalid account status: {account_status}. Expected AccountStatus enum, got {type(account_status).__name__}")
+                f"Invalid account status: {status}. Expected AccountStatus enum, got {type(status).__name__}")
 
         self.account_id = account_id
         self.client = client
         self._balance = balance
-        self.account_status = account_status
+        self.status = status
+
+    @property
+    def balance(self) -> Decimal:
+        return self._balance
 
     @abstractmethod
     def deposit(self, amount: Decimal) -> None:
@@ -64,12 +103,12 @@ class AbstractAccount(ABC):
         pass
 
     def _validate_status(self) -> None:
-        if self.account_status == AccountStatus.FROZEN:
+        if self.status == AccountStatus.FROZEN:
             raise AccountFrozenError("Operation prohibited: account is frozen")
-        if self.account_status == AccountStatus.CLOSED:
+        if self.status == AccountStatus.CLOSED:
             raise AccountClosedError("Operation prohibited: account is closed")
-        if self.account_status != AccountStatus.ACTIVE:
-            raise InvalidOperationError(f"Operation prohibited: account status is {self.account_status.name}")
+        if self.status != AccountStatus.ACTIVE:
+            raise InvalidOperationError(f"Operation prohibited: account status is {self.status.name}")
 
     @staticmethod
     def _validate_money_amount(amount: Decimal, param_name: str = "Amount", allow_zero: bool = False) -> None:
@@ -100,7 +139,7 @@ class BankAccount(AbstractAccount):
             client: Client,
             balance: Decimal,
             currency: Currency,
-            account_status: AccountStatus,
+            status: AccountStatus,
             account_id: Optional[str] = None
     ) -> None:
         if not isinstance(currency, Currency):
@@ -110,7 +149,7 @@ class BankAccount(AbstractAccount):
         self._validate_money_amount(balance, param_name="Initial balance", allow_zero=True)
         actual_id = account_id if account_id is not None else generate_short_uuid()
         self.currency = currency
-        super().__init__(actual_id, client, balance, account_status)
+        super().__init__(actual_id, client, balance, status)
 
         logger.info("Account created. %s", self)
 
@@ -120,21 +159,21 @@ class BankAccount(AbstractAccount):
         self._balance += amount
         logger.info(
             "Deposit successful: Account=%s, Amount=+%s %s, New Balance=%s %s",
-            self.account_id[-4:], amount, self.currency.value, self._balance, self.currency.value
+            self.account_id[-4:], amount, self.currency.value, self.balance, self.currency.value
         )
 
     def withdraw(self, amount: Decimal) -> None:
         self._validate_status()
         self._validate_money_amount(amount, param_name="Withdrawal amount")
 
-        if self._balance < amount:
+        if self.balance < amount:
             raise InsufficientFundsError(
-                f"Withdraw failed: insufficient balance {self._balance} {self.currency.value}")
+                f"Withdraw failed: insufficient balance {self.balance} {self.currency.value}")
 
         self._balance -= amount
         logger.info(
             "Withdrawal successful: Account=%s, Amount=-%s %s, New Balance=%s %s",
-            self.account_id[-4:], amount, self.currency.value, self._balance, self.currency.value
+            self.account_id[-4:], amount, self.currency.value, self.balance, self.currency.value
         )
 
     def get_account_info(self) -> str:
@@ -143,8 +182,100 @@ class BankAccount(AbstractAccount):
     def __str__(self) -> str:
         return (
             f"Type: {self.__class__.__name__} | Client: {self.client} | Account Number: {self.account_id[-4:]} | "
-            f"Status: {self.account_status.name} | Balance: {self._balance} {self.currency.value}"
+            f"Status: {self.status.name} | Balance: {self.balance} {self.currency.value}"
         )
+
+
+class Bank:
+    def __init__(self, name: str = "Zalupabank") -> None:
+        self.name = name
+        self.clients: dict[str, Client] = {}
+        self.accounts: dict[str, BankAccount] = {}
+
+    def add_client(self, client: Client) -> None:
+        if client.client_id in self.clients:
+            raise InvalidOperationError(f"Client {client.client_id} already exists.")
+        self.clients[client.client_id] = client
+
+    def open_account(self, client_id: str, currency: Currency,
+                     initial_balance: Decimal = Decimal("0.00")) -> BankAccount:
+        client = self.clients.get(client_id)
+        if not client:
+            raise InvalidOperationError("Client not found.")
+        if client.status == ClientStatus.BLOCKED:
+            raise InvalidOperationError("Client is blocked.")
+
+        account = BankAccount(
+            client=client,
+            balance=initial_balance,
+            currency=currency,
+            status=AccountStatus.ACTIVE
+        )
+
+        self.accounts[account.account_id] = account
+        client.accounts.append(account)
+
+        logger.info("Account created. %s", account)
+        return account
+
+    def close_account(self, account_id: str) -> None:
+        account = self._get_account(account_id)
+        if account.status == AccountStatus.CLOSED:
+            raise InvalidOperationError("Account is already closed.")
+        if account.balance != Decimal("0.00"):
+            raise InvalidOperationError(f"Cannot close account with non-zero balance ({account.balance}).")
+
+        account.status = AccountStatus.CLOSED
+        logger.info("Account %s closed.", account_id[-4:])
+
+    def freeze_account(self, account_id: str) -> None:
+        account = self._get_account(account_id)
+        if account.status == AccountStatus.CLOSED:
+            raise InvalidOperationError("Cannot freeze a closed account.")
+        if account.status == AccountStatus.FROZEN:
+            raise InvalidOperationError("Account is already frozen.")
+
+        account.status = AccountStatus.FROZEN
+        logger.info("Account %s frozen.", account_id[-4:])
+
+    def unfreeze_account(self, account_id: str) -> None:
+        account = self._get_account(account_id)
+        if account.status != AccountStatus.FROZEN:
+            raise InvalidOperationError(f"Cannot unfreeze account with status {account.status.name}.")
+
+        account.status = AccountStatus.ACTIVE
+        logger.info("Account %s unfrozen.", account_id[-4:])
+
+    def authenticate_client(self, client_id: str, password: str) -> bool:
+        client = self.clients.get(client_id)
+        if not client:
+            raise InvalidOperationError(f"Client with ID {client_id} not found.")
+
+        if client.status == ClientStatus.BLOCKED:
+            raise InvalidOperationError(f"Client {client_id} is blocked.")
+
+        if password == client.password:
+            client.reset_login_attempts()
+            return True
+
+        client.fail_login()
+        if client.login_attempts >= 3:
+            client.status = ClientStatus.BLOCKED
+            logger.warning("Client %s blocked due to 3 failed login attempts.", client_id)
+
+        return False
+
+    def search_accounts(self, client_id: str) -> list[BankAccount]:
+        client = self.clients.get(client_id)
+        if not client:
+            raise InvalidOperationError(f"Client {client_id} not found.")
+        return client.accounts
+
+    def _get_account(self, account_id: str) -> BankAccount:
+        account = self.accounts.get(account_id)
+        if not account:
+            raise InvalidOperationError(f"Account {account_id} not found.")
+        return account
 
 
 class SavingsAccount(BankAccount):
@@ -153,7 +284,7 @@ class SavingsAccount(BankAccount):
             client: Client,
             balance: Decimal,
             currency: Currency,
-            account_status: AccountStatus,
+            status: AccountStatus,
             min_balance: Decimal,
             monthly_rate: Decimal,
             account_id: Optional[str] = None
@@ -165,35 +296,35 @@ class SavingsAccount(BankAccount):
         self.min_balance = min_balance
         self.monthly_rate = monthly_rate
 
-        super().__init__(client, balance, currency, account_status, account_id)
+        super().__init__(client, balance, currency, status, account_id)
 
-        if self._balance < self.min_balance:
+        if self.balance < self.min_balance:
             raise InsufficientFundsError(f"Balance cannot be less than min balance: "
-                                         f"balance= {self._balance} {self.currency.value}, "
+                                         f"balance= {self.balance} {self.currency.value}, "
                                          f"min_balance= {min_balance} {self.currency.value}")
 
     def withdraw(self, amount: Decimal) -> None:
         self._validate_status()
         self._validate_money_amount(amount, param_name="Withdrawal amount")
 
-        if (self._balance - amount) < self.min_balance:
+        if (self.balance - amount) < self.min_balance:
             raise InsufficientFundsError(f"Withdraw failed: remaining balance would drop below min balance "
                                          f"({self.min_balance} {self.currency.value})")
 
         self._balance -= amount
         logger.info(
             "Withdrawal successful: Account=%s, Amount=-%s %s, New Balance=%s %s",
-            self.account_id[-4:], amount, self.currency.value, self._balance, self.currency.value
+            self.account_id[-4:], amount, self.currency.value, self.balance, self.currency.value
         )
 
     def apply_monthly_interest(self) -> None:
         self._validate_status()
-        interest_amount = (self._balance * (self.monthly_rate / Decimal("100.00"))).quantize(
+        interest_amount = (self.balance * (self.monthly_rate / Decimal("100.00"))).quantize(
             Decimal("0.01"), rounding=ROUND_HALF_EVEN
         )
         self._balance += interest_amount
         logger.info("Monthly interest applied: Account=%s, Added=%s %s, New Balance =%s %s",
-                    self.account_id[-4:], interest_amount, self.currency.value, self._balance, self.currency.value)
+                    self.account_id[-4:], interest_amount, self.currency.value, self.balance, self.currency.value)
 
     def __str__(self) -> str:
         return super().__str__() + f" | Min Balance: {self.min_balance} {self.currency.value} | Monthly Rate: {self.monthly_rate}%"
@@ -205,7 +336,7 @@ class PremiumAccount(BankAccount):
             client: Client,
             balance: Decimal,
             currency: Currency,
-            account_status: AccountStatus,
+            status: AccountStatus,
             overdraft_limit: Decimal,
             fixed_fee: Decimal,
             account_id: Optional[str] = None
@@ -216,14 +347,14 @@ class PremiumAccount(BankAccount):
         self.overdraft_limit = overdraft_limit
         self.fixed_fee = fixed_fee
 
-        super().__init__(client, balance, currency, account_status, account_id)
+        super().__init__(client, balance, currency, status, account_id)
 
     def withdraw(self, amount: Decimal) -> None:
         self._validate_status()
         self._validate_money_amount(amount, param_name="Withdrawal amount")
 
         total_deduction = amount + self.fixed_fee
-        total_available_funds = self._balance + self.overdraft_limit
+        total_available_funds = self.balance + self.overdraft_limit
         account_currency = self.currency.value
         if total_available_funds < total_deduction:
             raise InsufficientFundsError(
@@ -233,7 +364,7 @@ class PremiumAccount(BankAccount):
         self._balance -= total_deduction
         logger.info(
             "Premium withdrawal successful: Account=%s, Amount=%s %s, Fee=-%s %s, New Balance=%s %s",
-            self.account_id[-4:], amount, account_currency, self.fixed_fee, account_currency, self._balance,
+            self.account_id[-4:], amount, account_currency, self.fixed_fee, account_currency, self.balance,
             account_currency
         )
 
@@ -264,7 +395,7 @@ class InvestmentAccount(BankAccount):
             client: Client,
             balance: Decimal,
             currency: Currency,
-            account_status: AccountStatus,
+            status: AccountStatus,
             account_id: Optional[str] = None
     ) -> None:
         self.portfolio: Dict[AssetType, Decimal] = {
@@ -273,16 +404,16 @@ class InvestmentAccount(BankAccount):
             AssetType.ETF: Decimal("0.00")
         }
 
-        super().__init__(client, balance, currency, account_status, account_id)
+        super().__init__(client, balance, currency, status, account_id)
 
     def buy_asset(self, asset_type: str | AssetType, amount: Decimal) -> None:
         self._validate_status()
         asset = AssetType.normalize(asset_type)
         self._validate_money_amount(amount, param_name="Amount")
 
-        if self._balance < amount:
+        if self.balance < amount:
             raise InsufficientFundsError(
-                f"Asset buy failed: balance {self._balance} {self.currency.value} insufficient"
+                f"Asset buy failed: balance {self.balance} {self.currency.value} insufficient"
             )
         self._balance -= amount
         self.portfolio[asset] += amount
