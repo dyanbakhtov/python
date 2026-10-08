@@ -1,3 +1,4 @@
+from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -227,7 +228,7 @@ class PremiumAccount(BankAccount):
         if total_available_funds < total_deduction:
             raise InsufficientFundsError(
                 f"Withdraw failed: total required ({total_deduction} {account_currency} incl. fee {self.fixed_fee} {account_currency})"
-                f"exceeds total available funds with overdraft ({total_available_funds} {account_currency})"
+                f" exceeds total available funds with overdraft ({total_available_funds} {account_currency})"
             )
         self._balance -= total_deduction
         logger.info(
@@ -266,13 +267,13 @@ class InvestmentAccount(BankAccount):
             account_status: AccountStatus,
             account_id: Optional[str] = None
     ) -> None:
-        super().__init__(client, balance, currency, account_status, account_id)
-
         self.portfolio: Dict[AssetType, Decimal] = {
             AssetType.STOCKS: Decimal("0.00"),
             AssetType.BONDS: Decimal("0.00"),
             AssetType.ETF: Decimal("0.00")
         }
+
+        super().__init__(client, balance, currency, account_status, account_id)
 
     def buy_asset(self, asset_type: str | AssetType, amount: Decimal) -> None:
         self._validate_status()
@@ -285,7 +286,7 @@ class InvestmentAccount(BankAccount):
             )
         self._balance -= amount
         self.portfolio[asset] += amount
-        logger.info("Asset buy successful: Asset=%s, Amount=%s", asset, amount)
+        logger.info("Asset buy successful: %s, Amount=%s", asset, amount)
 
     def project_yearly_growth(self, growth_rates: Dict[str | AssetType, Decimal]) -> Decimal:
         self._validate_status()
@@ -302,7 +303,7 @@ class InvestmentAccount(BankAccount):
         for asset_type, invested_amount in self.portfolio.items():
             if invested_amount > Decimal("0.00"):
                 if asset_type not in normalized_rates:
-                    logger.warning("Missing growth rate for asset type: '%s'", asset_type)
+                    logger.warning("Missing growth rate for asset type: '%s'", asset_type.value)
                     continue
                 rate = normalized_rates[asset_type]
                 growth = (invested_amount * (rate / Decimal("100"))).quantize(
@@ -311,3 +312,10 @@ class InvestmentAccount(BankAccount):
                 logger.info("growth rate for %s: %s", asset_type, growth)
                 total_growth += growth
         return total_growth
+
+    def __str__(self) -> str:
+        portfolio_details = ", ".join(
+            f"{asset.value}: {amount} {self.currency.value}"
+            for asset, amount in self.portfolio.items()
+        )
+        return super().__str__() + f" | Portfolio: [{portfolio_details}]"
