@@ -51,8 +51,8 @@ if __name__ == "__main__":
     except BankAccountError as e:
         logger.warning(f"{e.__class__.__name__}: {e}")
 
-    premium_account = PremiumAccount(test_client, Decimal("100000"), Currency.USD, AccountStatus.ACTIVE, Decimal("50000"),
-                                     Decimal("100"))
+    premium_account = PremiumAccount(test_client, Decimal("100000"), Currency.USD, AccountStatus.ACTIVE,
+                                     Decimal("50000"), Decimal("100"))
     premium_account.withdraw(Decimal("100000"))
 
     try:
@@ -75,3 +75,4 @@ if __name__ == "__main__":
                     AssetType.ETF: Decimal("7.00")}
     yearly_growth = investment_account.project_yearly_growth(growth_rates)
     logger.info("Projected yearly growth: %s %s", yearly_growth, investment_account.currency.value)
+    logger.info(investment_account.get_account_info())
