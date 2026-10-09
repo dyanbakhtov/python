@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -199,9 +200,7 @@ class Bank:
 
     def open_account(self, client_id: str, currency: Currency,
                      initial_balance: Decimal = Decimal("0.00")) -> BankAccount:
-        client = self.clients.get(client_id)
-        if not client:
-            raise InvalidOperationError("Client not found.")
+        client = self._get_client(client_id)
         if client.status == ClientStatus.BLOCKED:
             raise InvalidOperationError("Client is blocked.")
 
@@ -214,8 +213,6 @@ class Bank:
 
         self.accounts[account.account_id] = account
         client.accounts.append(account)
-
-        logger.info("Account created. %s", account)
         return account
 
     def close_account(self, account_id: str) -> None:
@@ -247,9 +244,7 @@ class Bank:
         logger.info("Account %s unfrozen.", account_id[-4:])
 
     def authenticate_client(self, client_id: str, password: str) -> bool:
-        client = self.clients.get(client_id)
-        if not client:
-            raise InvalidOperationError(f"Client with ID {client_id} not found.")
+        client = self._get_client(client_id)
 
         if client.status == ClientStatus.BLOCKED:
             raise InvalidOperationError(f"Client {client_id} is blocked.")
@@ -265,11 +260,31 @@ class Bank:
 
         return False
 
-    def search_accounts(self, client_id: str) -> list[BankAccount]:
+    def search_accounts(
+            self,
+            client_id: Optional[str] = None,
+            currency: Optional[Currency] = None,
+            status: Optional[AccountStatus] = None,
+    ) -> list[BankAccount]:
+        result = list(self.accounts.values())
+
+        if client_id is not None:
+            self._get_client(client_id)
+            result = [acc for acc in result if acc.client.client_id == client_id]
+
+        if currency is not None:
+            result = [acc for acc in result if acc.currency == currency]
+
+        if status is not None:
+            result = [acc for acc in result if acc.status == status]
+
+        return result
+
+    def _get_client(self, client_id: str) -> Client:
         client = self.clients.get(client_id)
         if not client:
-            raise InvalidOperationError(f"Client {client_id} not found.")
-        return client.accounts
+            raise InvalidOperationError(f"Client with ID {client_id} not found.")
+        return client
 
     def _get_account(self, account_id: str) -> BankAccount:
         account = self.accounts.get(account_id)
