@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_EVEN
 from enum import Enum
 from typing import Optional, Dict
@@ -16,7 +16,7 @@ from exceptions import (
     InsufficientFundsError,
     InvalidOperationError,
 )
-from utils import generate_short_uuid
+from utils import generate_short_uuid, check_night_curfew
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,7 @@ class Client:
     accounts: list[BankAccount] = field(default_factory=list)
     client_id: str = field(default_factory=generate_short_uuid)
     _password: str = field(default_factory=generate_short_uuid)
+    suspicious_activities: list[str] = field(default_factory=list)
 
     @property
     def age(self) -> int:
@@ -54,6 +55,12 @@ class Client:
 
     def reset_login_attempts(self) -> None:
         self.login_attempts = 0
+
+    def flag_suspicious_activity(self, reason: str) -> None:
+        timestamp = datetime.now().isoformat()
+        entry = f"[{timestamp}] {reason}"
+        self.suspicious_activities.append(entry)
+        logger.warning("Suspicious activity flagged for Client %s: %s", self.client_id[-4:], reason)
 
     def __post_init__(self) -> None:
         if not self.is_adult:
@@ -154,9 +161,20 @@ class BankAccount(AbstractAccount):
 
         logger.info("Account created. %s", self)
 
+    SUSPICIOUS_TRANSACTION_THRESHOLD = Decimal("500000.00")
+
+    def _validate_operation_safety(self, amount: Decimal) -> None:
+        check_night_curfew()
+
+        if amount >= self.SUSPICIOUS_TRANSACTION_THRESHOLD:
+            self.client.flag_suspicious_activity(
+                f"Крупная операция на сумму {amount} {self.currency.value} по счету {self.account_id[-4:]}"
+            )
+
     def deposit(self, amount: Decimal) -> None:
         self._validate_status()
         self._validate_money_amount(amount, param_name="Deposit amount")
+        self._validate_operation_safety(amount)
         self._balance += amount
         logger.info(
             "Deposit successful: Account=%s, Amount=+%s %s, New Balance=%s %s",
@@ -166,6 +184,7 @@ class BankAccount(AbstractAccount):
     def withdraw(self, amount: Decimal) -> None:
         self._validate_status()
         self._validate_money_amount(amount, param_name="Withdrawal amount")
+        self._validate_operation_safety(amount)
 
         if self.balance < amount:
             raise InsufficientFundsError(
@@ -243,6 +262,8 @@ class Bank:
         account.status = AccountStatus.ACTIVE
         logger.info("Account %s unfrozen.", account_id[-4:])
 
+    MAX_LOGIN_ATTEMPTS = 3
+
     def authenticate_client(self, client_id: str, password: str) -> bool:
         client = self._get_client(client_id)
 
@@ -254,8 +275,9 @@ class Bank:
             return True
 
         client.fail_login()
-        if client.login_attempts >= 3:
+        if client.login_attempts >= self.MAX_LOGIN_ATTEMPTS:
             client.status = ClientStatus.BLOCKED
+            client.flag_suspicious_activity(f"Maximum number of login attempts exceeded. Client is blocked.")
             logger.warning("Client %s blocked due to 3 failed login attempts.", client_id)
 
         return False
@@ -321,6 +343,7 @@ class SavingsAccount(BankAccount):
     def withdraw(self, amount: Decimal) -> None:
         self._validate_status()
         self._validate_money_amount(amount, param_name="Withdrawal amount")
+        self._validate_operation_safety(amount)
 
         if (self.balance - amount) < self.min_balance:
             raise InsufficientFundsError(f"Withdraw failed: remaining balance would drop below min balance "
@@ -367,6 +390,7 @@ class PremiumAccount(BankAccount):
     def withdraw(self, amount: Decimal) -> None:
         self._validate_status()
         self._validate_money_amount(amount, param_name="Withdrawal amount")
+        self._validate_operation_safety(amount)
 
         total_deduction = amount + self.fixed_fee
         total_available_funds = self.balance + self.overdraft_limit
@@ -425,6 +449,7 @@ class InvestmentAccount(BankAccount):
         self._validate_status()
         asset = AssetType.normalize(asset_type)
         self._validate_money_amount(amount, param_name="Amount")
+        self._validate_operation_safety(amount)
 
         if self.balance < amount:
             raise InsufficientFundsError(
