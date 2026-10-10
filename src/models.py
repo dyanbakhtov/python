@@ -26,6 +26,23 @@ class ClientStatus(Enum):
     BLOCKED = "BLOCKED"
 
 
+class Currency(Enum):
+    RUB = "RUB"
+    USD = "USD"
+    EUR = "EUR"
+    KZT = "KZT"
+    CNY = "CNY"
+
+
+DEFAULT_EXCHANGE_RATES: dict[Currency, Decimal] = {
+    Currency.RUB: Decimal("1.0"),
+    Currency.USD: Decimal("90.0"),
+    Currency.EUR: Decimal("98.0"),
+    Currency.KZT: Decimal("0.2"),
+    Currency.CNY: Decimal("12.5"),
+}
+
+
 @dataclass
 class Client:
     name: str
@@ -61,6 +78,34 @@ class Client:
         entry = f"[{timestamp}] {reason}"
         self.suspicious_activities.append(entry)
         logger.warning("Suspicious activity flagged for Client %s: %s", self.client_id[-4:], reason)
+
+    def get_total_balance(
+            self,
+            target_currency: Currency = Currency.RUB,
+            rates: dict[Currency, Decimal] | None = None
+    ) -> Decimal:
+        if rates is None:
+            rates = DEFAULT_EXCHANGE_RATES
+
+        if target_currency not in rates:
+            raise InvalidOperationError(f"Target currency rate {target_currency.value} not found.")
+
+        target_rate = rates[target_currency]
+        total_in_base = Decimal("0.00")
+
+        for account in self.accounts:
+            if account.status == AccountStatus.CLOSED:
+                continue
+
+            if account.currency not in rates:
+                raise InvalidOperationError(f"Currency rate {account.currency.value} not found.")
+
+            acc_rate = rates[account.currency]
+            balance_in_base = account.balance * acc_rate
+            total_in_base += balance_in_base
+
+        total_in_target = total_in_base / target_rate
+        return total_in_target.quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
 
     def __post_init__(self) -> None:
         if not self.is_adult:
@@ -133,14 +178,6 @@ class AbstractAccount(ABC):
                 raise InvalidOperationError(f"{param_name} must be positive, got {amount}")
 
 
-class Currency(Enum):
-    RUB = "RUB"
-    USD = "USD"
-    EUR = "EUR"
-    KZT = "KZT"
-    CNY = "CNY"
-
-
 class BankAccount(AbstractAccount):
     def __init__(
             self,
@@ -168,7 +205,7 @@ class BankAccount(AbstractAccount):
 
         if amount >= self.SUSPICIOUS_TRANSACTION_THRESHOLD:
             self.client.flag_suspicious_activity(
-                f"Крупная операция на сумму {amount} {self.currency.value} по счету {self.account_id[-4:]}"
+                f"Large transaction of {amount} {self.currency.value} on the account {self.account_id[-4:]}"
             )
 
     def deposit(self, amount: Decimal) -> None:
@@ -301,6 +338,53 @@ class Bank:
             result = [acc for acc in result if acc.status == status]
 
         return result
+
+    def get_total_balance(
+            self,
+            target_currency: Currency = Currency.RUB,
+            rates: dict[Currency, Decimal] | None = None
+    ) -> Decimal:
+        if rates is None:
+            rates = DEFAULT_EXCHANGE_RATES
+
+        if target_currency not in rates:
+            raise InvalidOperationError(f"Target currency rate {target_currency.value} not found.")
+
+        target_rate = rates[target_currency]
+        total_in_base = Decimal("0.00")
+
+        for account in self.accounts.values():
+            if account.status == AccountStatus.CLOSED:
+                continue
+
+            if account.currency not in rates:
+                raise InvalidOperationError(f"Currency rate {account.currency.value} not found.")
+
+            acc_rate = rates[account.currency]
+            balance_in_base = account.balance * acc_rate
+            total_in_base += balance_in_base
+
+        total_in_target = total_in_base / target_rate
+        return total_in_target.quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
+
+    def get_clients_ranking(
+            self,
+            target_currency: Currency = Currency.RUB,
+            rates: dict[Currency, Decimal] | None = None,
+            top_n: int | None = None
+    ) -> list[tuple[Client, Decimal]]:
+
+        ranking = [
+            (client, client.get_total_balance(target_currency, rates))
+            for client in self.clients.values()
+        ]
+
+        ranking.sort(key=lambda item: item[1], reverse=True)
+
+        if top_n is not None:
+            return ranking[:top_n]
+
+        return ranking
 
     def _get_client(self, client_id: str) -> Client:
         client = self.clients.get(client_id)
