@@ -253,6 +253,8 @@ class Bank:
         if client.client_id in self.clients:
             raise InvalidOperationError(f"Client {client.client_id} already exists.")
         self.clients[client.client_id] = client
+        logger.info(f"Client {client.client_id[-4:]} added.")
+
 
     def open_account(self, client_id: str, currency: Currency,
                      initial_balance: Decimal = Decimal("0.00")) -> BankAccount:
