@@ -16,3 +16,9 @@ class InsufficientFundsError(BankAccountError):
 
 class InvalidOperationError(BankAccountError):
     pass
+
+class NightOperationsForbiddenError(InvalidOperationError):
+    pass
+
+class SuspiciousActivityError(InvalidOperationError):
+    pass
