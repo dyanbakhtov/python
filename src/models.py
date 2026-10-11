@@ -21,6 +21,42 @@ from utils import generate_short_uuid, check_night_curfew
 logger = logging.getLogger(__name__)
 
 
+class TransactionStatus(Enum):
+    SUCCESS = "SUCCESS"
+    REJECTED = "REJECTED"
+    PENDING = "PENDING"
+
+
+class TransactionType(Enum):
+    DEPOSIT = "DEPOSIT"
+    WITHDRAWAL = "WITHDRAWAL"
+    TRANSFER = "TRANSFER"
+
+
+@dataclass
+class Transaction:
+    amount: Decimal
+    currency: Currency
+    transaction_type: TransactionType
+    sender_account_id: Optional[str] = None
+    receiver_account_id: Optional[str] = None
+    commission: Decimal = Decimal("0.00")
+    status: TransactionStatus = TransactionStatus.PENDING
+    rejection_reason: Optional[str] = None
+    transaction_id: str = field(default_factory=generate_short_uuid)
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+
+    def __str__(self) -> str:
+        sender = self.sender_account_id[-4:] if self.sender_account_id else "N/A"
+        receiver = self.receiver_account_id[-4:] if self.receiver_account_id else "N/A"
+        reason = f" | Reason: {self.rejection_reason}" if self.rejection_reason else ""
+        return (
+            f"[{self.timestamp}] ID: {self.transaction_id[-4:]} | Type: {self.transaction_type.value} | "
+            f"Amount: {self.amount} {self.currency.value} (Fee: {self.commission}) | "
+            f"From: {sender} -> To: {receiver} | Status: {self.status.value}{reason}"
+        )
+
+
 class ClientStatus(Enum):
     ACTIVE = "ACTIVE"
     BLOCKED = "BLOCKED"
@@ -255,7 +291,6 @@ class Bank:
         self.clients[client.client_id] = client
         logger.info(f"Client {client.client_id[-4:]} added.")
 
-
     def open_account(self, client_id: str, currency: Currency,
                      initial_balance: Decimal = Decimal("0.00")) -> BankAccount:
         client = self._get_client(client_id)
@@ -453,6 +488,8 @@ class SavingsAccount(BankAccount):
     def __str__(self) -> str:
         return super().__str__() + f" | Min Balance: {self.min_balance} {self.currency.value} | Monthly Rate: {self.monthly_rate}%"
 
+    def get_account_info(self) -> str:
+        return str(self)
 
 class PremiumAccount(BankAccount):
     def __init__(
@@ -497,6 +534,9 @@ class PremiumAccount(BankAccount):
         return super().__str__() + (f" | Overdraft Limit: {self.overdraft_limit} {self.currency.value}"
                                     f" | Fixed Fee: {self.fixed_fee} {self.currency.value}")
 
+    def get_account_info(self) -> str:
+        return str(self)
+
 
 class AssetType(str, Enum):
     STOCKS = "stocks"
@@ -530,6 +570,9 @@ class InvestmentAccount(BankAccount):
         }
 
         super().__init__(client, balance, currency, status, account_id)
+
+    def withdraw(self, amount: Decimal) -> None:
+        super().withdraw(amount)
 
     def buy_asset(self, asset_type: str | AssetType, amount: Decimal) -> None:
         self._validate_status()
@@ -576,3 +619,6 @@ class InvestmentAccount(BankAccount):
             for asset, amount in self.portfolio.items()
         )
         return super().__str__() + f" | Portfolio: [{portfolio_details}]"
+
+    def get_account_info(self) -> str:
+        return str(self)
