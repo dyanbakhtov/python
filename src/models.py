@@ -22,39 +22,141 @@ logger = logging.getLogger(__name__)
 
 
 class TransactionStatus(Enum):
-    SUCCESS = "SUCCESS"
-    REJECTED = "REJECTED"
     PENDING = "PENDING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    RETRYING = "RETRYING"
 
 
 class TransactionType(Enum):
-    DEPOSIT = "DEPOSIT"
-    WITHDRAWAL = "WITHDRAWAL"
-    TRANSFER = "TRANSFER"
+    INTERNAL = "INTERNAL"
+    EXTERNAL = "EXTERNAL"
 
 
 @dataclass
 class Transaction:
+    sender: BankAccount
+    recipient: BankAccount
     amount: Decimal
     currency: Currency
     transaction_type: TransactionType
-    sender_account_id: Optional[str] = None
-    receiver_account_id: Optional[str] = None
-    commission: Decimal = Decimal("0.00")
-    status: TransactionStatus = TransactionStatus.PENDING
-    rejection_reason: Optional[str] = None
     transaction_id: str = field(default_factory=generate_short_uuid)
-    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    fee: Decimal = field(default_factory=lambda: Decimal("0.00"))
+    status: TransactionStatus = TransactionStatus.PENDING
+    failure_reason: Optional[str] = None
+    priority: int = 0
+    created_at: datetime = field(default_factory=datetime.now)
+    processed_at: Optional[datetime] = None
 
     def __str__(self) -> str:
-        sender = self.sender_account_id[-4:] if self.sender_account_id else "N/A"
-        receiver = self.receiver_account_id[-4:] if self.receiver_account_id else "N/A"
-        reason = f" | Reason: {self.rejection_reason}" if self.rejection_reason else ""
         return (
-            f"[{self.timestamp}] ID: {self.transaction_id[-4:]} | Type: {self.transaction_type.value} | "
-            f"Amount: {self.amount} {self.currency.value} (Fee: {self.commission}) | "
-            f"From: {sender} -> To: {receiver} | Status: {self.status.value}{reason}"
+            f"Tx[{self.transaction_id[-4:]}] | {self.transaction_type.value} | "
+            f"Amount: {self.amount} {self.currency.value} (Fee: {self.fee}) | "
+            f"Status: {self.status.value}"
         )
+
+
+class TransactionQueue:
+    def __init__(self) -> None:
+        self._queue: list[Transaction] = []
+
+    def add_transaction(self, transaction: Transaction) -> None:
+        if transaction.status != TransactionStatus.PENDING:
+            raise InvalidOperationError("Only pending transactions can be added to the queue.")
+        self._queue.append(transaction)
+        self._queue.sort(key=lambda t: t.priority, reverse=True)
+        logger.info("Transaction %s added to queue with priority %s.",
+                    transaction.transaction_id[-4:], transaction.priority)
+
+    def get_next(self) -> Optional[Transaction]:
+        for tx in self._queue:
+            if tx.status == TransactionStatus.PENDING:
+                return tx
+        return None
+
+    def cancel_transaction(self, transaction_id: str) -> None:
+        for tx in self._queue:
+            if tx.transaction_id == transaction_id:
+                if tx.status == TransactionStatus.COMPLETED:
+                    raise InvalidOperationError("Cannot cancel an already completed transaction.")
+                tx.status = TransactionStatus.CANCELLED
+                tx.failure_reason = "Cancelled by user or system request."
+                logger.info("Transaction %s cancelled.", transaction_id[-4:])
+                return
+        raise InvalidOperationError(f"Transaction {transaction_id} not found in queue.")
+
+    @property
+    def pending_count(self) -> int:
+        return sum(1 for tx in self._queue if tx.status == TransactionStatus.PENDING)
+
+
+class TransactionProcessor:
+    EXTERNAL_FEE_RATE = Decimal("0.01")
+    MAX_RETRIES = 3
+
+    def __init__(self, exchange_rates: Optional[dict[Currency, Decimal]] = None) -> None:
+        self.rates = exchange_rates or DEFAULT_EXCHANGE_RATES
+
+    def process_transaction(self, transaction: Transaction, max_retries: int = 3) -> None:
+        attempts = 0
+        while attempts < max_retries:
+            try:
+                self._execute(transaction)
+                return
+            except (InsufficientFundsError, AccountFrozenError, AccountClosedError) as e:
+                attempts += 1
+                transaction.status = TransactionStatus.RETRYING
+                logger.warning("Transaction %s failed (attempt %s/%s): %s. Retrying...",
+                               transaction.transaction_id[-4:], attempts, max_retries, e)
+                if attempts >= max_retries:
+                    transaction.status = TransactionStatus.FAILED
+                    transaction.failure_reason = str(e)
+                    transaction.processed_at = datetime.now()
+                    logger.error("Transaction %s permanently failed: %s", transaction.transaction_id[-4:], e)
+                    raise
+            except Exception as e:
+                transaction.status = TransactionStatus.FAILED
+                transaction.failure_reason = str(e)
+                transaction.processed_at = datetime.now()
+                logger.error("Unexpected error in transaction %s: %s", transaction.transaction_id[-4:], e)
+                raise
+
+    def _execute(self, transaction: Transaction) -> None:
+        sender = transaction.sender
+        recipient = transaction.recipient
+
+        fee = Decimal("0.00")
+        if transaction.transaction_type == TransactionType.EXTERNAL:
+            fee = (transaction.amount * self.EXTERNAL_FEE_RATE).quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
+        transaction.fee = fee
+        sender_amount = transaction.amount + fee
+
+        recipient_amount = transaction.amount
+        if sender.currency != recipient.currency:
+            recipient_amount = self._convert(transaction.amount, sender.currency, recipient.currency)
+
+        sender.process_outgoing_transfer(sender_amount)
+        recipient.process_incoming_transfer(recipient_amount)
+
+        transaction.status = TransactionStatus.COMPLETED
+        transaction.processed_at = datetime.now()
+        logger.info(
+            "Transaction %s completed successfully: -%s %s from Account %s, +%s %s to Account %s (Fee: %s)",
+            transaction.transaction_id[-4:], sender_amount, sender.currency.value, sender.account_id[-4:],
+            recipient_amount, recipient.currency.value, recipient.account_id[-4:], fee
+        )
+
+    def _convert(self, amount: Decimal, from_curr: Currency, to_curr: Currency) -> Decimal:
+        if from_curr == to_curr:
+            return amount
+
+        if from_curr not in self.rates or to_curr not in self.rates:
+            raise InvalidOperationError(f"Exchange rate not found for {from_curr.value} -> {to_curr.value}")
+
+        amount_in_base = amount * self.rates[from_curr]
+        result = amount_in_base / self.rates[to_curr]
+        return result.quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
 
 
 class ClientStatus(Enum):
@@ -199,6 +301,9 @@ class AbstractAccount(ABC):
         if self.status != AccountStatus.ACTIVE:
             raise InvalidOperationError(f"Operation prohibited: account status is {self.status.name}")
 
+    def validate_status_for_transaction(self) -> None:
+        self._validate_status()
+
     @staticmethod
     def _validate_money_amount(amount: Decimal, param_name: str = "Amount", allow_zero: bool = False) -> None:
         if not isinstance(amount, Decimal):
@@ -267,6 +372,28 @@ class BankAccount(AbstractAccount):
         logger.info(
             "Withdrawal successful: Account=%s, Amount=-%s %s, New Balance=%s %s",
             self.account_id[-4:], amount, self.currency.value, self.balance, self.currency.value
+        )
+
+    def process_incoming_transfer(self, amount: Decimal) -> None:
+        self.validate_status_for_transaction()
+        self._balance += amount
+        logger.info(
+            "Incoming transfer received: Account=%s, Amount=+%s %s, New Balance=%s %s",
+            self.account_id[-4:], amount, self.currency.value, self.balance, self.currency.value
+        )
+
+    def process_outgoing_transfer(self, amount_with_fee: Decimal) -> None:
+        self.validate_status_for_transaction()
+
+        if self.balance < amount_with_fee:
+            raise InsufficientFundsError(
+                f"Insufficient funds: balance {self.balance} {self.currency.value}, required {amount_with_fee}"
+            )
+
+        self._balance -= amount_with_fee
+        logger.info(
+            "Outgoing transfer sent: Account=%s, Amount=-%s %s, New Balance=%s %s",
+            self.account_id[-4:], amount_with_fee, self.currency.value, self.balance, self.currency.value
         )
 
     def get_account_info(self) -> str:
@@ -491,6 +618,7 @@ class SavingsAccount(BankAccount):
     def get_account_info(self) -> str:
         return str(self)
 
+
 class PremiumAccount(BankAccount):
     def __init__(
             self,
@@ -528,6 +656,21 @@ class PremiumAccount(BankAccount):
             "Premium withdrawal successful: Account=%s, Amount=%s %s, Fee=-%s %s, New Balance=%s %s",
             self.account_id[-4:], amount, account_currency, self.fixed_fee, account_currency, self.balance,
             account_currency
+        )
+
+    def process_outgoing_transfer(self, amount_with_fee: Decimal) -> None:
+        self.validate_status_for_transaction()
+
+        total_available = self.balance + self.overdraft_limit
+        if total_available < amount_with_fee:
+            raise InsufficientFundsError(
+                f"Premium account overdraft exceeded: available {total_available} {self.currency.value}, required {amount_with_fee}"
+            )
+
+        self._balance -= amount_with_fee
+        logger.info(
+            "Premium outgoing transfer sent: Account=%s, Amount=-%s %s, New Balance=%s %s",
+            self.account_id[-4:], amount_with_fee, self.currency.value, self.balance, self.currency.value
         )
 
     def __str__(self) -> str:
