@@ -47,7 +47,29 @@ class Transaction:
     failure_reason: Optional[str] = None
     priority: int = 0
     created_at: datetime = field(default_factory=datetime.now)
+    scheduled_at: Optional[datetime] = None
     processed_at: Optional[datetime] = None
+
+    def __post_init__(self):
+        if not isinstance(self.amount, Decimal):
+            raise InvalidOperationError(f"Amount must be a Decimal, got {type(self.amount).__name__}")
+        if not self.amount.is_finite():
+            raise InvalidOperationError(f"Amount must be finite number, got {self.amount}")
+        if self.amount <= Decimal("0.00"):
+            raise InvalidOperationError(f"Amount must be positive, got {self.amount}")
+
+        if not isinstance(self.currency, Currency):
+            raise InvalidOperationError(
+                f"Invalid currency: {self.currency}. Expected Currency enum, got {type(self.currency).__name__}"
+            )
+
+        if not isinstance(self.transaction_type, TransactionType):
+            raise InvalidOperationError(
+                f"Invalid transaction type: {self.transaction_type}. Expected TransactionType enum, got {type(self.transaction_type).__name__}"
+            )
+
+        if self.scheduled_at is None:
+            self.scheduled_at = self.created_at
 
     def __str__(self) -> str:
         return (
@@ -70,8 +92,9 @@ class TransactionQueue:
                     transaction.transaction_id[-4:], transaction.priority)
 
     def get_next(self) -> Optional[Transaction]:
+        now = datetime.now()
         for tx in self._queue:
-            if tx.status == TransactionStatus.PENDING:
+            if tx.status == TransactionStatus.PENDING and tx.scheduled_at <= now:
                 return tx
         return None
 
@@ -135,6 +158,8 @@ class TransactionProcessor:
         recipient_amount = transaction.amount
         if sender.currency != recipient.currency:
             recipient_amount = self._convert(transaction.amount, sender.currency, recipient.currency)
+
+        recipient.validate_status_for_transaction()
 
         sender.process_outgoing_transfer(sender_amount)
         recipient.process_incoming_transfer(recipient_amount)
@@ -375,7 +400,6 @@ class BankAccount(AbstractAccount):
         )
 
     def process_incoming_transfer(self, amount: Decimal) -> None:
-        self.validate_status_for_transaction()
         self._balance += amount
         logger.info(
             "Incoming transfer received: Account=%s, Amount=+%s %s, New Balance=%s %s",
@@ -383,6 +407,7 @@ class BankAccount(AbstractAccount):
         )
 
     def process_outgoing_transfer(self, amount_with_fee: Decimal) -> None:
+        self._validate_operation_safety(amount_with_fee)
         self.validate_status_for_transaction()
 
         if self.balance < amount_with_fee:
@@ -601,6 +626,22 @@ class SavingsAccount(BankAccount):
         logger.info(
             "Withdrawal successful: Account=%s, Amount=-%s %s, New Balance=%s %s",
             self.account_id[-4:], amount, self.currency.value, self.balance, self.currency.value
+        )
+
+    def process_outgoing_transfer(self, amount_with_fee: Decimal) -> None:
+        self.validate_status_for_transaction()
+        self._validate_operation_safety(amount_with_fee)
+
+        if (self.balance - amount_with_fee) < self.min_balance:
+            raise InsufficientFundsError(
+                f"Savings transfer failed: remaining balance would drop below min balance "
+                f"({self.min_balance} {self.currency.value})"
+            )
+
+        self._balance -= amount_with_fee
+        logger.info(
+            "Savings outgoing transfer sent: Account=%s, Amount=-%s %s, New Balance=%s %s",
+            self.account_id[-4:], amount_with_fee, self.currency.value, self.balance, self.currency.value
         )
 
     def apply_monthly_interest(self) -> None:
