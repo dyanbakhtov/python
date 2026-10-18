@@ -188,8 +188,11 @@ def run_tests_day3() -> None:
     logger.info("USD accounts found: %s", len(search_res))
 
 
+from datetime import datetime, timedelta
+
+
 def run_tests_day4() -> None:
-    logger.info("\n=== RUNNING DAY 4 TESTS: TRANSACTIONS & QUEUE ===")
+    logger.info("\n=== RUNNING DAY 4 TESTS: TRANSACTIONS & QUEUE (WITH FIXES) ===")
 
     client1 = Client(
         name="Семён Персунов",
@@ -208,6 +211,15 @@ def run_tests_day4() -> None:
     acc_rub_1 = BankAccount(client1, Decimal("50000.00"), Currency.RUB, AccountStatus.ACTIVE)
     acc_usd_1 = BankAccount(client1, Decimal("1000.00"), Currency.USD, AccountStatus.ACTIVE)
 
+    acc_savings = SavingsAccount(
+        client=client1,
+        balance=Decimal("10000.00"),
+        currency=Currency.RUB,
+        status=AccountStatus.ACTIVE,
+        min_balance=Decimal("5000.00"),
+        monthly_rate=Decimal("1.0")
+    )
+
     acc_premium = PremiumAccount(
         client=client2,
         balance=Decimal("5000.00"),
@@ -222,37 +234,59 @@ def run_tests_day4() -> None:
     tx_queue = TransactionQueue()
     processor = TransactionProcessor()
 
+    try:
+        bad_tx1 = Transaction(
+            sender=acc_rub_1, recipient=acc_premium,
+            amount=Decimal("-100.00"), currency=Currency.RUB,
+            transaction_type=TransactionType.INTERNAL
+        )
+    except Exception as e:
+        logger.info("Caught expected negative amount error: %s", e)
+
+
+    logger.info("\n--- 2. Testing Scheduled (Delayed) Transactions ---")
+    future_time = datetime.now() + timedelta(hours=1)
+    scheduled_tx = Transaction(
+        sender=acc_rub_1,
+        recipient=acc_premium,
+        amount=Decimal("1000.00"),
+        currency=Currency.RUB,
+        transaction_type=TransactionType.INTERNAL,
+        priority=100,
+        scheduled_at=future_time
+    )
+    tx_queue.add_transaction(scheduled_tx)
+
+    next_tx = tx_queue.get_next()
+    if next_tx is None:
+        logger.info("Scheduled transaction correctly ignored by get_next() before its time.")
+
     transactions_data = [
-        # (sender, recipient, amount, currency, type, priority)
+        (acc_rub_1, acc_frozen, Decimal("1000.00"), Currency.RUB, TransactionType.INTERNAL, 10),
+
+        (acc_savings, acc_rub_1, Decimal("8000.00"), Currency.RUB, TransactionType.INTERNAL, 8),
+
         (acc_rub_1, acc_usd_1, Decimal("5000.00"), Currency.RUB, TransactionType.INTERNAL, 1),
         (acc_rub_1, acc_premium, Decimal("10000.00"), Currency.RUB, TransactionType.EXTERNAL, 5),
         (acc_usd_1, acc_rub_1, Decimal("100.00"), Currency.USD, TransactionType.EXTERNAL, 2),
         (acc_premium, acc_rub_1, Decimal("3000.00"), Currency.RUB, TransactionType.INTERNAL, 3),
-
-        (acc_frozen, acc_rub_1, Decimal("1000.00"), Currency.RUB, TransactionType.INTERNAL, 10),
-
-        (acc_rub_1, acc_premium, Decimal("2000.00"), Currency.RUB, TransactionType.INTERNAL, 0),
-        (acc_rub_1, acc_usd_1, Decimal("1500.00"), Currency.RUB, TransactionType.EXTERNAL, 1),
-        (acc_premium, acc_rub_1, Decimal("1000.00"), Currency.RUB, TransactionType.INTERNAL, 2),
-        (acc_rub_1, acc_premium, Decimal("500.00"), Currency.RUB, TransactionType.INTERNAL, 0),
-        (acc_usd_1, acc_premium, Decimal("50.00"), Currency.USD, TransactionType.EXTERNAL, 4),
     ]
 
     for sender, recipient, amount, curr, tx_type, priority in transactions_data:
-        tx = Transaction(
-            sender=sender,
-            recipient=recipient,
-            amount=amount,
-            currency=curr,
-            transaction_type=tx_type,
-            priority=priority
-        )
         try:
+            tx = Transaction(
+                sender=sender,
+                recipient=recipient,
+                amount=amount,
+                currency=curr,
+                transaction_type=tx_type,
+                priority=priority
+            )
             tx_queue.add_transaction(tx)
         except Exception as e:
             logger.error("Failed to add transaction to queue: %s", e)
 
-    logger.info("Total transactions in queue: %s", tx_queue.pending_count)
+    logger.info("Total pending transactions in queue: %s", tx_queue.pending_count)
 
     while tx_queue.pending_count > 0:
         tx = tx_queue.get_next()
