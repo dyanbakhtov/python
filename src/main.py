@@ -1,8 +1,11 @@
 import logging
-from datetime import date
+from datetime import date, time
 from decimal import Decimal
+from unittest.mock import patch
 
-from exceptions import BankAccountError
+import models
+import utils
+from exceptions import BankAccountError, NightOperationsForbiddenError
 from models import Client, BankAccount, AccountStatus, Currency, SavingsAccount, PremiumAccount, InvestmentAccount, \
     AssetType, ClientStatus, Bank, TransactionQueue, TransactionProcessor, TransactionType, Transaction
 
@@ -300,6 +303,54 @@ def run_tests_day4() -> None:
         except Exception as e:
             logger.info("Transaction cancelled/failed: %s (Reason: %s)", e, tx.failure_reason)
 
+    logger.info("\n--- 3. Testing Premium account operation safety checks ---")
+
+    premium_safety_acc = PremiumAccount(
+        client=client2,
+        balance=Decimal("5000.00"),
+        currency=Currency.RUB,
+        status=AccountStatus.ACTIVE,
+        overdraft_limit=Decimal("10000.00"),
+        fixed_fee=Decimal("50.00")
+    )
+
+    balance_before_night = premium_safety_acc.balance
+    try:
+        with patch.object(models, "check_night_curfew",
+                          lambda: utils.check_night_curfew(time(3, 0))):
+            premium_safety_acc.process_outgoing_transfer(Decimal("100.00"))
+    except NightOperationsForbiddenError as e:
+        logger.info("Caught expected night curfew error for premium transfer: %s", e)
+    else:
+        logger.error("Premium transfer PASSED during night time (00:00-05:00)! This must not happen.")
+
+    if premium_safety_acc.balance == balance_before_night:
+        logger.info("Blocked night transfer did not change balance: %s %s",
+                    premium_safety_acc.balance, premium_safety_acc.currency.value)
+    else:
+        logger.error("Blocked night transfer changed balance: %s -> %s", balance_before_night, premium_safety_acc.balance)
+
+    premium_large_acc = PremiumAccount(
+        client=client2,
+        balance=Decimal("600000.00"),
+        currency=Currency.RUB,
+        status=AccountStatus.ACTIVE,
+        overdraft_limit=Decimal("10000.00"),
+        fixed_fee=Decimal("50.00")
+    )
+
+    try:
+        premium_large_acc.process_outgoing_transfer(Decimal("550000.00"))
+        logger.info("Large premium transfer COMPLETED. Sender balance now: %s %s",
+                    premium_large_acc.balance, premium_large_acc.currency.value)
+    except BankAccountError as e:
+        logger.error("Large premium transfer unexpectedly failed: %s", e)
+
+    if client2.suspicious_activities:
+        logger.info("Suspicious activities of Client %s: %s",
+                    client2.client_id, client2.suspicious_activities)
+    else:
+        logger.error("Large premium transfer was NOT flagged as suspicious! This must not happen.")
 
 if __name__ == "__main__":
     run_tests_day1()
