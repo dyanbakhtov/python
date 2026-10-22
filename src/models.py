@@ -62,6 +62,10 @@ class Transaction:
             raise InvalidOperationError(
                 f"Invalid currency: {self.currency}. Expected Currency enum, got {type(self.currency).__name__}"
             )
+        if self.currency != self.sender.currency:
+            raise InvalidOperationError(
+                f"Transaction currency {self.currency.value} does not match sender currency {self.sender.currency.value}"
+            )
 
         if not isinstance(self.transaction_type, TransactionType):
             raise InvalidOperationError(
@@ -159,7 +163,7 @@ class TransactionProcessor:
         if sender.currency != recipient.currency:
             recipient_amount = self._convert(transaction.amount, sender.currency, recipient.currency)
 
-        recipient.validate_status_for_transaction()
+        recipient.validate_transaction(recipient_amount)
 
         sender.process_outgoing_transfer(sender_amount)
         recipient.process_incoming_transfer(recipient_amount)
@@ -326,9 +330,6 @@ class AbstractAccount(ABC):
         if self.status != AccountStatus.ACTIVE:
             raise InvalidOperationError(f"Operation prohibited: account status is {self.status.name}")
 
-    def validate_status_for_transaction(self) -> None:
-        self._validate_status()
-
     @staticmethod
     def _validate_money_amount(amount: Decimal, param_name: str = "Amount", allow_zero: bool = False) -> None:
         if not isinstance(amount, Decimal):
@@ -365,6 +366,10 @@ class BankAccount(AbstractAccount):
         logger.info("Account created. %s", self)
 
     SUSPICIOUS_TRANSACTION_THRESHOLD = Decimal("500000.00")
+
+    def validate_transaction(self, amount: Decimal) -> None:
+        self._validate_status()
+        self._validate_operation_safety(amount)
 
     def _validate_operation_safety(self, amount: Decimal) -> None:
         check_night_curfew()
@@ -407,8 +412,7 @@ class BankAccount(AbstractAccount):
         )
 
     def process_outgoing_transfer(self, amount_with_fee: Decimal) -> None:
-        self._validate_operation_safety(amount_with_fee)
-        self.validate_status_for_transaction()
+        self.validate_transaction(amount_with_fee)
 
         if self.balance < amount_with_fee:
             raise InsufficientFundsError(
@@ -629,8 +633,7 @@ class SavingsAccount(BankAccount):
         )
 
     def process_outgoing_transfer(self, amount_with_fee: Decimal) -> None:
-        self.validate_status_for_transaction()
-        self._validate_operation_safety(amount_with_fee)
+        self.validate_transaction(amount_with_fee)
 
         if (self.balance - amount_with_fee) < self.min_balance:
             raise InsufficientFundsError(
@@ -700,7 +703,7 @@ class PremiumAccount(BankAccount):
         )
 
     def process_outgoing_transfer(self, amount_with_fee: Decimal) -> None:
-        self.validate_status_for_transaction()
+        self.validate_transaction(amount_with_fee)
 
         total_available = self.balance + self.overdraft_limit
         if total_available < amount_with_fee:
