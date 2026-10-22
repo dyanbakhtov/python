@@ -246,6 +246,14 @@ def run_tests_day4() -> None:
     except Exception as e:
         logger.info("Caught expected negative amount error: %s", e)
 
+    try:
+        bad_currency_tx = Transaction(
+            sender=acc_usd_1, recipient=acc_premium,
+            amount=Decimal("10.00"), currency=Currency.RUB,
+            transaction_type=TransactionType.EXTERNAL
+        )
+    except Exception as e:
+        logger.info("Caught expected currency mismatch error: %s", e)
 
     logger.info("\n--- 2. Testing Scheduled (Delayed) Transactions ---")
     future_time = datetime.now() + timedelta(hours=1)

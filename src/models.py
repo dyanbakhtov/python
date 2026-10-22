@@ -62,6 +62,10 @@ class Transaction:
             raise InvalidOperationError(
                 f"Invalid currency: {self.currency}. Expected Currency enum, got {type(self.currency).__name__}"
             )
+        if self.currency != self.sender.currency:
+            raise InvalidOperationError(
+                f"Transaction currency {self.currency.value} does not match sender currency {self.sender.currency.value}"
+            )
 
         if not isinstance(self.transaction_type, TransactionType):
             raise InvalidOperationError(
