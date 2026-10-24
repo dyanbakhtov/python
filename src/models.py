@@ -3,9 +3,9 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_EVEN
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import Optional, Dict
 
 from dateutil.relativedelta import relativedelta
@@ -13,12 +13,181 @@ from dateutil.relativedelta import relativedelta
 from exceptions import (
     AccountClosedError,
     AccountFrozenError,
+    BankAccountError,
     InsufficientFundsError,
     InvalidOperationError,
+    SuspiciousActivityError,
 )
-from utils import generate_short_uuid, check_night_curfew
+from utils import CURFEW_END, CURFEW_START, generate_short_uuid, check_night_curfew
 
 logger = logging.getLogger(__name__)
+
+
+class TransactionStatus(Enum):
+    PENDING = "PENDING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    RETRYING = "RETRYING"
+
+
+class TransactionType(Enum):
+    INTERNAL = "INTERNAL"
+    EXTERNAL = "EXTERNAL"
+
+
+@dataclass
+class Transaction:
+    sender: BankAccount
+    recipient: BankAccount
+    amount: Decimal
+    currency: Currency
+    transaction_type: TransactionType
+    transaction_id: str = field(default_factory=generate_short_uuid)
+    fee: Decimal = field(default_factory=lambda: Decimal("0.00"))
+    status: TransactionStatus = TransactionStatus.PENDING
+    failure_reason: Optional[str] = None
+    priority: int = 0
+    created_at: datetime = field(default_factory=datetime.now)
+    scheduled_at: Optional[datetime] = None
+    processed_at: Optional[datetime] = None
+
+    def __post_init__(self):
+        if not isinstance(self.amount, Decimal):
+            raise InvalidOperationError(f"Amount must be a Decimal, got {type(self.amount).__name__}")
+        if not self.amount.is_finite():
+            raise InvalidOperationError(f"Amount must be finite number, got {self.amount}")
+        if self.amount <= Decimal("0.00"):
+            raise InvalidOperationError(f"Amount must be positive, got {self.amount}")
+
+        if not isinstance(self.currency, Currency):
+            raise InvalidOperationError(
+                f"Invalid currency: {self.currency}. Expected Currency enum, got {type(self.currency).__name__}"
+            )
+        if self.currency != self.sender.currency:
+            raise InvalidOperationError(
+                f"Transaction currency {self.currency.value} does not match sender currency {self.sender.currency.value}"
+            )
+
+        if not isinstance(self.transaction_type, TransactionType):
+            raise InvalidOperationError(
+                f"Invalid transaction type: {self.transaction_type}. Expected TransactionType enum, got {type(self.transaction_type).__name__}"
+            )
+
+        if self.scheduled_at is None:
+            self.scheduled_at = self.created_at
+
+    def __str__(self) -> str:
+        return (
+            f"Tx[{self.transaction_id[-4:]}] | {self.transaction_type.value} | "
+            f"Amount: {self.amount} {self.currency.value} (Fee: {self.fee}) | "
+            f"Status: {self.status.value}"
+        )
+
+
+class TransactionQueue:
+    def __init__(self) -> None:
+        self._queue: list[Transaction] = []
+
+    def add_transaction(self, transaction: Transaction) -> None:
+        if transaction.status != TransactionStatus.PENDING:
+            raise InvalidOperationError("Only pending transactions can be added to the queue.")
+        self._queue.append(transaction)
+        self._queue.sort(key=lambda t: t.priority, reverse=True)
+        logger.info("Transaction %s added to queue with priority %s.",
+                    transaction.transaction_id[-4:], transaction.priority)
+
+    def get_next(self) -> Optional[Transaction]:
+        now = datetime.now()
+        for tx in self._queue:
+            if tx.status == TransactionStatus.PENDING and tx.scheduled_at <= now:
+                return tx
+        return None
+
+    def cancel_transaction(self, transaction_id: str) -> None:
+        for tx in self._queue:
+            if tx.transaction_id == transaction_id:
+                if tx.status == TransactionStatus.COMPLETED:
+                    raise InvalidOperationError("Cannot cancel an already completed transaction.")
+                tx.status = TransactionStatus.CANCELLED
+                tx.failure_reason = "Cancelled by user or system request."
+                logger.info("Transaction %s cancelled.", transaction_id[-4:])
+                return
+        raise InvalidOperationError(f"Transaction {transaction_id} not found in queue.")
+
+    @property
+    def pending_count(self) -> int:
+        return sum(1 for tx in self._queue if tx.status == TransactionStatus.PENDING)
+
+
+class TransactionProcessor:
+    EXTERNAL_FEE_RATE = Decimal("0.01")
+    MAX_TRANSACTION_RETRIES = 3
+
+    def __init__(self, exchange_rates: Optional[dict[Currency, Decimal]] = None) -> None:
+        self.rates = exchange_rates or DEFAULT_EXCHANGE_RATES
+
+    def process_transaction(self, transaction: Transaction) -> None:
+        attempts = 0
+        while attempts < self.MAX_TRANSACTION_RETRIES:
+            try:
+                self._execute(transaction)
+                return
+            except (InsufficientFundsError, AccountFrozenError, AccountClosedError) as e:
+                attempts += 1
+                transaction.status = TransactionStatus.RETRYING
+                logger.warning("Transaction %s failed (attempt %s/%s): %s. Retrying...",
+                               transaction.transaction_id[-4:], attempts, self.MAX_TRANSACTION_RETRIES, e)
+                if attempts >= self.MAX_TRANSACTION_RETRIES:
+                    transaction.status = TransactionStatus.FAILED
+                    transaction.failure_reason = str(e)
+                    transaction.processed_at = datetime.now()
+                    logger.error("Transaction %s permanently failed: %s", transaction.transaction_id[-4:], e)
+                    raise
+            except Exception as e:
+                transaction.status = TransactionStatus.FAILED
+                transaction.failure_reason = str(e)
+                transaction.processed_at = datetime.now()
+                logger.error("Unexpected error in transaction %s: %s", transaction.transaction_id[-4:], e)
+                raise
+
+    def _execute(self, transaction: Transaction) -> None:
+        sender = transaction.sender
+        recipient = transaction.recipient
+
+        fee = Decimal("0.00")
+        if transaction.transaction_type == TransactionType.EXTERNAL:
+            fee = (transaction.amount * self.EXTERNAL_FEE_RATE).quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
+        transaction.fee = fee
+        sender_amount = transaction.amount + fee
+
+        recipient_amount = transaction.amount
+        if sender.currency != recipient.currency:
+            recipient_amount = self._convert(transaction.amount, sender.currency, recipient.currency)
+
+        recipient.validate_transaction(recipient_amount)
+
+        sender.process_outgoing_transfer(sender_amount)
+        recipient.process_incoming_transfer(recipient_amount)
+
+        transaction.status = TransactionStatus.COMPLETED
+        transaction.processed_at = datetime.now()
+        logger.info(
+            "Transaction %s completed successfully: -%s %s from Account %s, +%s %s to Account %s (Fee: %s)",
+            transaction.transaction_id[-4:], sender_amount, sender.currency.value, sender.account_id[-4:],
+            recipient_amount, recipient.currency.value, recipient.account_id[-4:], fee
+        )
+
+    def _convert(self, amount: Decimal, from_curr: Currency, to_curr: Currency) -> Decimal:
+        if from_curr == to_curr:
+            return amount
+
+        if from_curr not in self.rates or to_curr not in self.rates:
+            raise InvalidOperationError(f"Exchange rate not found for {from_curr.value} -> {to_curr.value}")
+
+        amount_in_base = amount * self.rates[from_curr]
+        result = amount_in_base / self.rates[to_curr]
+        return result.quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
 
 
 class ClientStatus(Enum):
@@ -200,6 +369,10 @@ class BankAccount(AbstractAccount):
 
     SUSPICIOUS_TRANSACTION_THRESHOLD = Decimal("500000.00")
 
+    def validate_transaction(self, amount: Decimal) -> None:
+        self._validate_status()
+        self._validate_operation_safety(amount)
+
     def _validate_operation_safety(self, amount: Decimal) -> None:
         check_night_curfew()
 
@@ -233,6 +406,27 @@ class BankAccount(AbstractAccount):
             self.account_id[-4:], amount, self.currency.value, self.balance, self.currency.value
         )
 
+    def process_incoming_transfer(self, amount: Decimal) -> None:
+        self._balance += amount
+        logger.info(
+            "Incoming transfer received: Account=%s, Amount=+%s %s, New Balance=%s %s",
+            self.account_id[-4:], amount, self.currency.value, self.balance, self.currency.value
+        )
+
+    def process_outgoing_transfer(self, amount_with_fee: Decimal) -> None:
+        self.validate_transaction(amount_with_fee)
+
+        if self.balance < amount_with_fee:
+            raise InsufficientFundsError(
+                f"Insufficient funds: balance {self.balance} {self.currency.value}, required {amount_with_fee}"
+            )
+
+        self._balance -= amount_with_fee
+        logger.info(
+            "Outgoing transfer sent: Account=%s, Amount=-%s %s, New Balance=%s %s",
+            self.account_id[-4:], amount_with_fee, self.currency.value, self.balance, self.currency.value
+        )
+
     def get_account_info(self) -> str:
         return str(self)
 
@@ -254,7 +448,6 @@ class Bank:
             raise InvalidOperationError(f"Client {client.client_id} already exists.")
         self.clients[client.client_id] = client
         logger.info(f"Client {client.client_id[-4:]} added.")
-
 
     def open_account(self, client_id: str, currency: Currency,
                      initial_balance: Decimal = Decimal("0.00")) -> BankAccount:
@@ -441,6 +634,21 @@ class SavingsAccount(BankAccount):
             self.account_id[-4:], amount, self.currency.value, self.balance, self.currency.value
         )
 
+    def process_outgoing_transfer(self, amount_with_fee: Decimal) -> None:
+        self.validate_transaction(amount_with_fee)
+
+        if (self.balance - amount_with_fee) < self.min_balance:
+            raise InsufficientFundsError(
+                f"Savings transfer failed: remaining balance would drop below min balance "
+                f"({self.min_balance} {self.currency.value})"
+            )
+
+        self._balance -= amount_with_fee
+        logger.info(
+            "Savings outgoing transfer sent: Account=%s, Amount=-%s %s, New Balance=%s %s",
+            self.account_id[-4:], amount_with_fee, self.currency.value, self.balance, self.currency.value
+        )
+
     def apply_monthly_interest(self) -> None:
         self._validate_status()
         interest_amount = (self.balance * (self.monthly_rate / Decimal("100.00"))).quantize(
@@ -452,6 +660,9 @@ class SavingsAccount(BankAccount):
 
     def __str__(self) -> str:
         return super().__str__() + f" | Min Balance: {self.min_balance} {self.currency.value} | Monthly Rate: {self.monthly_rate}%"
+
+    def get_account_info(self) -> str:
+        return str(self)
 
 
 class PremiumAccount(BankAccount):
@@ -493,9 +704,27 @@ class PremiumAccount(BankAccount):
             account_currency
         )
 
+    def process_outgoing_transfer(self, amount_with_fee: Decimal) -> None:
+        self.validate_transaction(amount_with_fee)
+
+        total_available = self.balance + self.overdraft_limit
+        if total_available < amount_with_fee:
+            raise InsufficientFundsError(
+                f"Premium account overdraft exceeded: available {total_available} {self.currency.value}, required {amount_with_fee}"
+            )
+
+        self._balance -= amount_with_fee
+        logger.info(
+            "Premium outgoing transfer sent: Account=%s, Amount=-%s %s, New Balance=%s %s",
+            self.account_id[-4:], amount_with_fee, self.currency.value, self.balance, self.currency.value
+        )
+
     def __str__(self) -> str:
         return super().__str__() + (f" | Overdraft Limit: {self.overdraft_limit} {self.currency.value}"
                                     f" | Fixed Fee: {self.fixed_fee} {self.currency.value}")
+
+    def get_account_info(self) -> str:
+        return str(self)
 
 
 class AssetType(str, Enum):
@@ -530,6 +759,9 @@ class InvestmentAccount(BankAccount):
         }
 
         super().__init__(client, balance, currency, status, account_id)
+
+    def withdraw(self, amount: Decimal) -> None:
+        super().withdraw(amount)
 
     def buy_asset(self, asset_type: str | AssetType, amount: Decimal) -> None:
         self._validate_status()
@@ -576,3 +808,412 @@ class InvestmentAccount(BankAccount):
             for asset, amount in self.portfolio.items()
         )
         return super().__str__() + f" | Portfolio: [{portfolio_details}]"
+
+    def get_account_info(self) -> str:
+        return str(self)
+
+
+# ============================================================
+# Day 5: audit and risk analysis
+# ============================================================
+
+
+class AuditLogLevel(IntEnum):
+    INFO = 1
+    WARNING = 2
+    ERROR = 3
+    CRITICAL = 4
+
+
+_AUDIT_LEVEL_TO_LOGGING: dict[AuditLogLevel, int] = {
+    AuditLogLevel.INFO: logging.INFO,
+    AuditLogLevel.WARNING: logging.WARNING,
+    AuditLogLevel.ERROR: logging.ERROR,
+    AuditLogLevel.CRITICAL: logging.CRITICAL,
+}
+
+
+class AuditCategory(str, Enum):
+    TRANSACTION = "TRANSACTION"
+    RISK = "RISK"
+    AUTH = "AUTH"
+    SYSTEM = "SYSTEM"
+
+
+@dataclass
+class AuditEntry:
+    level: AuditLogLevel
+    message: str
+    category: AuditCategory
+    timestamp: datetime = field(default_factory=datetime.now)
+    client_id: Optional[str] = None
+    account_id: Optional[str] = None
+
+    def to_file_line(self) -> str:
+        parts = [
+            self.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            self.level.name,
+            self.category.value,
+            self.message,
+        ]
+        if self.client_id:
+            parts.append(f"client={self.client_id[-4:]}")
+        if self.account_id:
+            parts.append(f"account={self.account_id[-4:]}")
+        return " | ".join(parts)
+
+    def __str__(self) -> str:
+        return self.to_file_line()
+
+
+class AuditLog:
+    def __init__(self, name: str = "audit") -> None:
+        self.name = name
+        self._entries: list[AuditEntry] = []
+
+    def log(
+            self,
+            level: AuditLogLevel,
+            message: str,
+            category: AuditCategory = AuditCategory.SYSTEM,
+            client_id: Optional[str] = None,
+            account_id: Optional[str] = None,
+    ) -> AuditEntry:
+        if not isinstance(level, AuditLogLevel):
+            raise InvalidOperationError(
+                f"Invalid audit level: {level}. Expected AuditLogLevel, got {type(level).__name__}"
+            )
+        if not isinstance(category, AuditCategory):
+            raise InvalidOperationError(
+                f"Invalid audit category: {category}. Expected AuditCategory, got {type(category).__name__}"
+            )
+
+        entry = AuditEntry(
+            level=level,
+            message=message,
+            category=category,
+            client_id=client_id,
+            account_id=account_id,
+        )
+        self._entries.append(entry)
+
+        logger.log(_AUDIT_LEVEL_TO_LOGGING[level], "[%s] %s: %s", self.name, category.value, message)
+        return entry
+
+    def info(self, message: str, **kwargs) -> AuditEntry:
+        return self.log(AuditLogLevel.INFO, message, **kwargs)
+
+    def warning(self, message: str, **kwargs) -> AuditEntry:
+        return self.log(AuditLogLevel.WARNING, message, **kwargs)
+
+    def error(self, message: str, **kwargs) -> AuditEntry:
+        return self.log(AuditLogLevel.ERROR, message, **kwargs)
+
+    def critical(self, message: str, **kwargs) -> AuditEntry:
+        return self.log(AuditLogLevel.CRITICAL, message, **kwargs)
+
+    def filter_entries(
+            self,
+            min_level: AuditLogLevel | None = None,
+            category: AuditCategory | None = None,
+            client_id: Optional[str] = None,
+            account_id: Optional[str] = None,
+    ) -> list[AuditEntry]:
+        result = self._entries
+        if min_level is not None:
+            result = [entry for entry in result if entry.level >= min_level]
+        if category is not None:
+            result = [entry for entry in result if entry.category == category]
+        if client_id is not None:
+            result = [entry for entry in result if entry.client_id == client_id]
+        if account_id is not None:
+            result = [entry for entry in result if entry.account_id == account_id]
+        return list(result)
+
+    def get_suspicious_entries(self) -> list[AuditEntry]:
+        return self.filter_entries(min_level=AuditLogLevel.WARNING, category=AuditCategory.RISK)
+
+    def get_error_statistics(self) -> dict[str, int]:
+        stats: dict[str, int] = {}
+        for entry in self.filter_entries(min_level=AuditLogLevel.ERROR):
+            stats[entry.category.value] = stats.get(entry.category.value, 0) + 1
+        return stats
+
+    def save_to_file(self, path: str) -> int:
+        with open(path, "w", encoding="utf-8") as file:
+            file.write(f"# Audit journal '{self.name}' — {len(self._entries)} records\n")
+            for entry in self._entries:
+                file.write(entry.to_file_line() + "\n")
+
+        logger.info("Audit journal '%s' saved to %s (%s records)", self.name, path, len(self._entries))
+        return len(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def __iter__(self):
+        return iter(self._entries)
+
+
+class RiskLevel(IntEnum):
+    LOW = 1
+    MEDIUM = 2
+    HIGH = 3
+
+
+class RiskFactor(Enum):
+    LARGE_AMOUNT = "large amount"
+    FREQUENT_OPERATIONS = "frequent operations"
+    NEW_RECIPIENT = "new recipient"
+    NIGHT_OPERATION = "night operation"
+
+
+@dataclass
+class RiskAssessment:
+    transaction: Transaction
+    risk_level: RiskLevel
+    risk_score: int
+    factors: list[RiskFactor] = field(default_factory=list)
+
+    @property
+    def is_suspicious(self) -> bool:
+        return self.risk_level is not RiskLevel.LOW
+
+    def __str__(self) -> str:
+        factors_text = ", ".join(factor.value for factor in self.factors) or "no"
+        return (
+            f"risk {self.risk_level.name} ({self.risk_score}), "
+            f"factors: {factors_text}, operation {self.transaction.transaction_id[-4:]}"
+        )
+
+
+@dataclass
+class RiskProfile:
+    client_id: str
+    client_name: str
+    transactions_analyzed: int = 0
+    suspicious_transactions: int = 0
+    blocked_transactions: int = 0
+    max_risk_level: RiskLevel = RiskLevel.LOW
+    total_risk_score: int = 0
+    factor_counts: dict[RiskFactor, int] = field(default_factory=dict)
+
+    def summary(self) -> str:
+        lines = [
+            f"Client {self.client_name} ({self.client_id[-4:]}):",
+            f"  transactions analyzed: {self.transactions_analyzed}",
+            f"  suspicious transactions: {self.suspicious_transactions}, blocked: {self.blocked_transactions}",
+            f"  max risk level: {self.max_risk_level.name}",
+            f"  total risk score: {self.total_risk_score}",
+            f"  risk factors: {self._factors_text()}",
+        ]
+        return "\n".join(lines)
+
+    def _factors_text(self) -> str:
+        if not self.factor_counts:
+            return "no"
+        return ", ".join(f"{factor.value} ×{count}" for factor, count in self.factor_counts.items())
+
+
+class RiskAnalyzer:
+    LARGE_AMOUNT_THRESHOLD_RUB = Decimal("500000.00")
+    FREQUENCY_THRESHOLD = 2
+    FREQUENCY_WINDOW_SECONDS = 1
+    MEDIUM_RISK_SCORE_THRESHOLD = 2
+    HIGH_RISK_SCORE_THRESHOLD = 4
+
+    FACTOR_WEIGHTS: dict[RiskFactor, int] = {
+        RiskFactor.LARGE_AMOUNT: 3,
+        RiskFactor.FREQUENT_OPERATIONS: 2,
+        RiskFactor.NEW_RECIPIENT: 2,
+        RiskFactor.NIGHT_OPERATION: 2,
+    }
+
+    def __init__(
+            self,
+            audit_log: AuditLog,
+            exchange_rates: Optional[dict[Currency, Decimal]] = None
+    ) -> None:
+        self.audit_log = audit_log
+        self._exchange_rates = exchange_rates or DEFAULT_EXCHANGE_RATES
+        self._transactions_by_client: dict[str, list[Transaction]] = {}
+        self._known_recipient_account_ids: set[str] = set()
+        self._assessments_by_client: dict[str, list[RiskAssessment]] = {}
+
+    def assess_transaction(self, transaction: Transaction) -> RiskAssessment:
+        client_id = transaction.sender.client.client_id
+        factors = self._collect_risk_factors(transaction, client_id)
+        score = sum(self.FACTOR_WEIGHTS[factor] for factor in factors)
+        return RiskAssessment(
+            transaction=transaction,
+            risk_level=self._score_to_level(score),
+            risk_score=score,
+            factors=factors,
+        )
+
+    def check_transaction(self, transaction: Transaction) -> RiskAssessment:
+        assessment = self.assess_transaction(transaction)
+        self._record(transaction, assessment)
+        self._publish_audit_event(transaction, assessment)
+
+        if assessment.risk_level is RiskLevel.HIGH:
+            self._block_transaction(transaction, assessment)
+
+        return assessment
+
+    # ---- risk profile reports -----------------------------------------------------------
+
+    def get_risk_profile(self, client_id: str) -> Optional[RiskProfile]:
+        assessments = self._assessments_by_client.get(client_id)
+        if not assessments:
+            return None
+
+        profile = RiskProfile(
+            client_id=client_id,
+            client_name=assessments[0].transaction.sender.client.name,
+            transactions_analyzed=len(assessments),
+        )
+
+        for assessment in assessments:
+            profile.total_risk_score += assessment.risk_score
+
+            if assessment.risk_level is RiskLevel.HIGH:
+                profile.blocked_transactions += 1
+            if assessment.is_suspicious:
+                profile.suspicious_transactions += 1
+            if assessment.risk_level > profile.max_risk_level:
+                profile.max_risk_level = assessment.risk_level
+
+            for factor in assessment.factors:
+                profile.factor_counts[factor] = profile.factor_counts.get(factor, 0) + 1
+
+        return profile
+
+    def get_all_risk_profiles(self) -> list[RiskProfile | None]:
+        return [self.get_risk_profile(client_id) for client_id in self._assessments_by_client]
+
+    # ---- helpers ---------------------------------------------------
+
+    def _collect_risk_factors(self, transaction: Transaction, client_id: str) -> list[RiskFactor]:
+        factors: list[RiskFactor] = []
+
+        if self._is_large_amount(transaction):
+            factors.append(RiskFactor.LARGE_AMOUNT)
+
+        if self._is_frequent(transaction, client_id):
+            factors.append(RiskFactor.FREQUENT_OPERATIONS)
+
+        if transaction.recipient.account_id not in self._known_recipient_account_ids:
+            factors.append(RiskFactor.NEW_RECIPIENT)
+
+        if CURFEW_START <= transaction.created_at.time() < CURFEW_END:
+            factors.append(RiskFactor.NIGHT_OPERATION)
+
+        return factors
+
+    def _is_large_amount(self, transaction: Transaction) -> bool:
+        rate = self._exchange_rates.get(transaction.currency)
+        if rate is None:
+            return False
+        return transaction.amount * rate >= self.LARGE_AMOUNT_THRESHOLD_RUB
+
+    def _is_frequent(self, transaction: Transaction, client_id: str) -> bool:
+        window_start = transaction.created_at - timedelta(seconds=self.FREQUENCY_WINDOW_SECONDS)
+        recent_count = sum(
+            1
+            for previous in self._transactions_by_client.get(client_id, [])
+            if previous.created_at >= window_start
+        )
+        return recent_count >= self.FREQUENCY_THRESHOLD
+
+    @classmethod
+    def _score_to_level(cls, score: int) -> RiskLevel:
+        if score >= cls.HIGH_RISK_SCORE_THRESHOLD:
+            return RiskLevel.HIGH
+        if score >= cls.MEDIUM_RISK_SCORE_THRESHOLD:
+            return RiskLevel.MEDIUM
+        return RiskLevel.LOW
+
+    def _record(self, transaction: Transaction, assessment: RiskAssessment) -> None:
+        client_id = transaction.sender.client.client_id
+        self._transactions_by_client.setdefault(client_id, []).append(transaction)
+        self._known_recipient_account_ids.add(transaction.recipient.account_id)
+        self._assessments_by_client.setdefault(client_id, []).append(assessment)
+
+    def _publish_audit_event(self, transaction: Transaction, assessment: RiskAssessment) -> None:
+        client_id = transaction.sender.client.client_id
+        account_id = transaction.sender.account_id
+        message = f"Transaction {transaction.transaction_id[-4:]}: {assessment}"
+
+        if assessment.risk_level is RiskLevel.HIGH:
+            self.audit_log.critical(
+                f"{message} — transaction will be blocked",
+                category=AuditCategory.RISK,
+                client_id=client_id,
+                account_id=account_id,
+            )
+        elif assessment.risk_level is RiskLevel.MEDIUM:
+            self.audit_log.warning(
+                f"{message} — suspicious transaction allowed to process (placed under monitoring)",
+                category=AuditCategory.RISK,
+                client_id=client_id,
+                account_id=account_id,
+            )
+        else:
+            self.audit_log.info(
+                message,
+                category=AuditCategory.RISK,
+                client_id=client_id,
+                account_id=account_id,
+            )
+
+    @staticmethod
+    def _block_transaction(transaction: Transaction, assessment: RiskAssessment) -> None:
+        reasons = ", ".join(factor.value for factor in assessment.factors)
+        message = (
+            f"Operation {transaction.transaction_id[-4:]} blocked: "
+            f"risk level {assessment.risk_level.name} ({assessment.risk_score}), "
+            f"reasons: {reasons}"
+        )
+        transaction.status = TransactionStatus.FAILED
+        transaction.failure_reason = message
+        transaction.processed_at = datetime.now()
+        raise SuspiciousActivityError(message)
+
+
+class RiskGuardedTransactionProcessor(TransactionProcessor):
+    def __init__(
+            self,
+            risk_analyzer: RiskAnalyzer,
+            exchange_rates: Optional[dict[Currency, Decimal]] = None
+    ) -> None:
+        super().__init__(exchange_rates)
+        self.risk_analyzer = risk_analyzer
+
+    def process_transaction(self, transaction: Transaction) -> None:
+        self.risk_analyzer.check_transaction(transaction)
+
+        try:
+            super().process_transaction(transaction)
+        except BankAccountError as e:
+            self._audit_transaction(
+                AuditLogLevel.ERROR,
+                f"Transaction {transaction.transaction_id[-4:]} aborted: {e}",
+                transaction,
+            )
+            raise
+
+        self._audit_transaction(
+            AuditLogLevel.INFO,
+            f"Transaction {transaction.transaction_id[-4:]} executed: {transaction}",
+            transaction,
+        )
+
+    def _audit_transaction(self, level: AuditLogLevel, message: str, transaction: Transaction) -> None:
+        self.risk_analyzer.audit_log.log(
+            level,
+            message,
+            category=AuditCategory.TRANSACTION,
+            client_id=transaction.sender.client.client_id,
+            account_id=transaction.sender.account_id,
+        )
