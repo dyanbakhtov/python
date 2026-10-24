@@ -1018,7 +1018,7 @@ class RiskProfile:
 class RiskAnalyzer:
     LARGE_AMOUNT_THRESHOLD_RUB = Decimal("500000.00")
     FREQUENCY_THRESHOLD = 2
-    FREQUENCY_WINDOW_MINUTES = 1
+    FREQUENCY_WINDOW_SECONDS = 1
     MEDIUM_RISK_SCORE_THRESHOLD = 2
     HIGH_RISK_SCORE_THRESHOLD = 4
 
@@ -1118,7 +1118,7 @@ class RiskAnalyzer:
         return transaction.amount * rate >= self.LARGE_AMOUNT_THRESHOLD_RUB
 
     def _is_frequent(self, transaction: Transaction, client_id: str) -> bool:
-        window_start = transaction.created_at - timedelta(minutes=self.FREQUENCY_WINDOW_MINUTES)
+        window_start = transaction.created_at - timedelta(seconds=self.FREQUENCY_WINDOW_SECONDS)
         recent_count = sum(
             1
             for previous in self._transactions_by_client.get(client_id, [])
