@@ -1,5 +1,6 @@
 import logging
 from datetime import date, time
+from time import sleep
 from decimal import Decimal
 from unittest.mock import patch
 
@@ -7,7 +8,8 @@ import models
 import utils
 from exceptions import BankAccountError, NightOperationsForbiddenError
 from models import Client, BankAccount, AccountStatus, Currency, SavingsAccount, PremiumAccount, InvestmentAccount, \
-    AssetType, ClientStatus, Bank, TransactionQueue, TransactionProcessor, TransactionType, Transaction
+    AssetType, ClientStatus, Bank, TransactionQueue, TransactionProcessor, TransactionType, Transaction, \
+    AuditLog, AuditLogLevel, RiskAnalyzer, RiskGuardedTransactionProcessor
 
 logging.basicConfig(
     level=logging.INFO,
@@ -195,7 +197,7 @@ from datetime import datetime, timedelta
 
 
 def run_tests_day4() -> None:
-    logger.info("\n=== RUNNING DAY 4 TESTS: TRANSACTIONS & QUEUE (WITH FIXES) ===")
+    logger.info("\n=== RUNNING DAY 4 TESTS: TRANSACTIONS & QUEUE ===")
 
     client1 = Client(
         name="Семён Персунов",
@@ -360,8 +362,150 @@ def run_tests_day4() -> None:
     else:
         logger.error("Large premium transfer was NOT flagged as suspicious! This must not happen.")
 
+
+def run_tests_day5() -> None:
+    logger.info("\n=== RUNNING DAY 5 TESTS: AUDIT & RISK ANALYSIS ===")
+
+    logger.info("\n== 1. Prepare clients and accounts ==")
+    client1 = Client(
+        name="Семён Персунов",
+        date_of_birth=date(1993, 5, 16),
+        phone_number="+71234567890",
+        status=ClientStatus.ACTIVE
+    )
+    client2 = Client(
+        name="Номад Горячев",
+        date_of_birth=date(1882, 10, 20),
+        phone_number="+79998887766",
+        status=ClientStatus.ACTIVE
+    )
+    client3 = Client(
+        name="Тимофей Куликов",
+        date_of_birth=date(2001, 3, 8),
+        phone_number="+79261112233",
+        status=ClientStatus.ACTIVE
+    )
+
+    acc_main = BankAccount(client1, Decimal("900000.00"), Currency.RUB, AccountStatus.ACTIVE)
+    acc_second = BankAccount(client1, Decimal("50000.00"), Currency.RUB, AccountStatus.ACTIVE)
+    acc_partner = BankAccount(client2, Decimal("100000.00"), Currency.RUB, AccountStatus.ACTIVE)
+    acc_frozen = BankAccount(client3, Decimal("10000.00"), Currency.RUB, AccountStatus.FROZEN)
+    acc_client3 = BankAccount(client3, Decimal("20000.00"), Currency.RUB, AccountStatus.ACTIVE)
+
+    # Shared audit log; risk analyzer writes to it, and the processor blocks dangerous operations
+    audit_log = AuditLog("audit")
+    analyzer = RiskAnalyzer(audit_log)
+    processor = RiskGuardedTransactionProcessor(analyzer)
+
+    # helper builder
+    def build_transaction(
+            sender: BankAccount,
+            recipient: BankAccount,
+            amount_str: str,
+            created_at=None
+    ) -> Transaction:
+        return Transaction(
+            sender=sender,
+            recipient=recipient,
+            amount=Decimal(amount_str),
+            currency=Currency.RUB,
+            transaction_type=TransactionType.INTERNAL,
+            created_at=created_at if created_at else datetime.now(),
+        )
+
+
+    sleep(1)
+    logger.info("\n== 2. Standard transactions ==")
+    for tx in (
+            build_transaction(acc_main, acc_second, "5000.00"),
+            build_transaction(acc_main, acc_second, "3000.00"),
+    ):
+        try:
+            processor.process_transaction(tx)
+        except BankAccountError as e:
+            logger.warning("Standard transaction aborted: %s", e)
+
+
+    sleep(1)
+    logger.info("\n== 3. Large amount to new recipient (high risk -> block) ==")
+    tx_large = build_transaction(acc_main, acc_partner, "600000.00")
+    try:
+        processor.process_transaction(tx_large)
+    except BankAccountError as e:
+        logger.warning("Suspicious transaction, blocked: %s", e)
+        logger.info("Blocked transaction status: %s, resason: %s",
+                    tx_large.status.value, tx_large.failure_reason)
+
+
+    sleep(1)
+    logger.info("\n== 4. Frequent transactions (series of money transfers -> medium risk) ==")
+    for i in range(1, 5):
+        tx = build_transaction(acc_main, acc_partner, "10000.00")
+        try:
+            processor.process_transaction(tx)
+        except BankAccountError as e:
+            logger.warning("Transaction %s aborted: %s", i, e)
+
+
+    sleep(1)
+    logger.info("\n== 5. Night time transactions ==")
+    night_time = datetime.combine(date.today(), time(2, 30))
+    tx_night_big = build_transaction(acc_partner, acc_main, "300000.00", created_at=night_time)
+    try:
+        processor.process_transaction(tx_night_big)
+    except BankAccountError as e:
+        logger.warning("Night time suspicious transaction blocked: %s", e)
+
+    tx_night_small = build_transaction(acc_partner, acc_second, "1000.00", created_at=night_time)
+    try:
+        processor.process_transaction(tx_night_small)
+    except BankAccountError as e:
+        logger.warning("Night time transaction aborted: %s", e)
+
+
+    sleep(1)
+    logger.info("\n== 6. Transfer to frozen account (analyze completes, execution fails) ==")
+    tx_to_frozen = build_transaction(acc_client3, acc_frozen, "500.00")
+    try:
+        processor.process_transaction(tx_to_frozen)
+    except BankAccountError as e:
+        logger.warning("Transaction aborted: %s (reason: %s)", e, tx_to_frozen.failure_reason)
+
+
+    sleep(1)
+    logger.info("\n== 7. Insufficient funds (analyze completes, execution fails) ==")
+    tx_nsf = build_transaction(acc_partner, acc_second, "150000.00")
+    try:
+        processor.process_transaction(tx_nsf)
+    except BankAccountError as e:
+        logger.warning("Transaction aborted: %s (reason: %s)", e, tx_nsf.failure_reason)
+
+
+    sleep(1)
+    logger.info("\n== 8. Audit reports ==")
+    audit_log.save_to_file("audit_log.txt")
+
+    suspicious = audit_log.get_suspicious_entries()
+    logger.info("Suspicious transactions in audit (%s):", len(suspicious))
+    for entry in suspicious:
+        logger.info("  %s", entry)
+
+    logger.info("Error statistics: %s", audit_log.get_error_statistics())
+
+    logger.info("Client risk profiles:")
+    for profile in analyzer.get_all_risk_profiles():
+        logger.info("%s", profile.summary())
+
+    logger.info(
+        "Critical records in audit: %s, records by client %s: %s",
+        len(audit_log.filter_entries(min_level=AuditLogLevel.CRITICAL)),
+        client1.name,
+        len(audit_log.filter_entries(client_id=client1.client_id)),
+    )
+
 if __name__ == "__main__":
-    run_tests_day1()
-    run_tests_day2()
-    run_tests_day3()
-    run_tests_day4()
+    # run_tests_day1()
+    # run_tests_day2()
+    # run_tests_day3()
+    # run_tests_day4()
+    run_tests_day5()
