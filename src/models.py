@@ -1015,6 +1015,27 @@ class RiskProfile:
         return ", ".join(f"{factor.value} ×{count}" for factor, count in self.factor_counts.items())
 
 
+class _ClientRiskHistory:
+    def __init__(self) -> None:
+        self.transactions: list[Transaction] = []
+        self.assessments: list[RiskAssessment] = []
+        self.trusted_recipient_account_ids: set[str] = set()
+
+    @property
+    def has_assessments(self) -> bool:
+        return bool(self.assessments)
+
+    def record(self, transaction: Transaction, assessment: RiskAssessment) -> None:
+        self.transactions.append(transaction)
+        self.assessments.append(assessment)
+
+    def add_trusted_recipient(self, account_id: str) -> None:
+        self.trusted_recipient_account_ids.add(account_id)
+
+    def count_transactions_since(self, moment: datetime) -> int:
+        return sum(1 for transaction in self.transactions if transaction.created_at >= moment)
+
+
 class RiskAnalyzer:
     LARGE_AMOUNT_THRESHOLD_RUB = Decimal("500000.00")
     FREQUENCY_THRESHOLD = 2
@@ -1036,9 +1057,7 @@ class RiskAnalyzer:
     ) -> None:
         self.audit_log = audit_log
         self._exchange_rates = exchange_rates or DEFAULT_EXCHANGE_RATES
-        self._transactions_by_client: dict[str, list[Transaction]] = {}
-        self._known_recipient_account_ids: set[str] = set()
-        self._assessments_by_client: dict[str, list[RiskAssessment]] = {}
+        self._history_by_client: dict[str, _ClientRiskHistory] = {}
 
     def assess_transaction(self, transaction: Transaction) -> RiskAssessment:
         client_id = transaction.sender.client.client_id
@@ -1064,17 +1083,17 @@ class RiskAnalyzer:
     # ---- risk profile reports -----------------------------------------------------------
 
     def get_risk_profile(self, client_id: str) -> Optional[RiskProfile]:
-        assessments = self._assessments_by_client.get(client_id)
-        if not assessments:
+        history = self._get_history(client_id)
+        if history is None or not history.has_assessments:
             return None
 
         profile = RiskProfile(
             client_id=client_id,
-            client_name=assessments[0].transaction.sender.client.name,
-            transactions_analyzed=len(assessments),
+            client_name=history.assessments[0].transaction.sender.client.name,
+            transactions_analyzed=len(history.assessments),
         )
 
-        for assessment in assessments:
+        for assessment in history.assessments:
             profile.total_risk_score += assessment.risk_score
 
             if assessment.risk_level is RiskLevel.HIGH:
@@ -1090,20 +1109,31 @@ class RiskAnalyzer:
         return profile
 
     def get_all_risk_profiles(self) -> list[RiskProfile | None]:
-        return [self.get_risk_profile(client_id) for client_id in self._assessments_by_client]
+        return [self.get_risk_profile(client_id) for client_id in self._history_by_client]
 
     # ---- helpers ---------------------------------------------------
 
+    def _get_history(self, client_id: str) -> Optional[_ClientRiskHistory]:
+        return self._history_by_client.get(client_id)
+
+    def _ensure_history(self, client_id: str) -> _ClientRiskHistory:
+        history = self._history_by_client.get(client_id)
+        if history is None:
+            history = _ClientRiskHistory()
+            self._history_by_client[client_id] = history
+        return history
+
     def _collect_risk_factors(self, transaction: Transaction, client_id: str) -> list[RiskFactor]:
         factors: list[RiskFactor] = []
+        history = self._get_history(client_id)
 
         if self._is_large_amount(transaction):
             factors.append(RiskFactor.LARGE_AMOUNT)
 
-        if self._is_frequent(transaction, client_id):
+        if self._is_frequent(transaction, history):
             factors.append(RiskFactor.FREQUENT_OPERATIONS)
 
-        if transaction.recipient.account_id not in self._known_recipient_account_ids:
+        if history is None or transaction.recipient.account_id not in history.trusted_recipient_account_ids:
             factors.append(RiskFactor.NEW_RECIPIENT)
 
         if CURFEW_START <= transaction.created_at.time() < CURFEW_END:
@@ -1117,13 +1147,9 @@ class RiskAnalyzer:
             return False
         return transaction.amount * rate >= self.LARGE_AMOUNT_THRESHOLD_RUB
 
-    def _is_frequent(self, transaction: Transaction, client_id: str) -> bool:
+    def _is_frequent(self, transaction: Transaction, history: Optional[_ClientRiskHistory]) -> bool:
         window_start = transaction.created_at - timedelta(seconds=self.FREQUENCY_WINDOW_SECONDS)
-        recent_count = sum(
-            1
-            for previous in self._transactions_by_client.get(client_id, [])
-            if previous.created_at >= window_start
-        )
+        recent_count = history.count_transactions_since(window_start) if history else 0
         return recent_count >= self.FREQUENCY_THRESHOLD
 
     @classmethod
@@ -1136,9 +1162,11 @@ class RiskAnalyzer:
 
     def _record(self, transaction: Transaction, assessment: RiskAssessment) -> None:
         client_id = transaction.sender.client.client_id
-        self._transactions_by_client.setdefault(client_id, []).append(transaction)
-        self._known_recipient_account_ids.add(transaction.recipient.account_id)
-        self._assessments_by_client.setdefault(client_id, []).append(assessment)
+        self._ensure_history(client_id).record(transaction, assessment)
+
+    def mark_recipient_as_trusted(self, transaction: Transaction) -> None:
+        client_id = transaction.sender.client.client_id
+        self._ensure_history(client_id).add_trusted_recipient(transaction.recipient.account_id)
 
     def _publish_audit_event(self, transaction: Transaction, assessment: RiskAssessment) -> None:
         client_id = transaction.sender.client.client_id
@@ -1202,6 +1230,8 @@ class RiskGuardedTransactionProcessor(TransactionProcessor):
                 transaction,
             )
             raise
+
+        self.risk_analyzer.mark_recipient_as_trusted(transaction)
 
         self._audit_transaction(
             AuditLogLevel.INFO,
