@@ -9,7 +9,7 @@ import utils
 from exceptions import BankAccountError, NightOperationsForbiddenError
 from models import Client, BankAccount, AccountStatus, Currency, SavingsAccount, PremiumAccount, InvestmentAccount, \
     AssetType, ClientStatus, Bank, TransactionQueue, TransactionProcessor, TransactionType, Transaction, \
-    AuditLog, AuditLogLevel, RiskAnalyzer, RiskGuardedTransactionProcessor
+    AuditLog, AuditLogLevel, RiskAnalyzer, RiskGuardedTransactionProcessor, TransactionHistory, TRANSACTION_HISTORY
 
 logging.basicConfig(
     level=logging.INFO,
@@ -503,9 +503,267 @@ def run_tests_day5() -> None:
         len(audit_log.filter_entries(client_id=client1.client_id)),
     )
 
+def run_tests_day6() -> None:
+    logger.info("\n=== RUNNING DAY 6 TESTS: FULL BANK DEMONSTRATION ===")
+
+    logger.info("\n== 1. Инициализация банка ==")
+    bank = Bank("ДемоБанк")
+    tx_queue = TransactionQueue()
+    history = TRANSACTION_HISTORY
+
+    audit_log = AuditLog("demo-audit")
+    analyzer = RiskAnalyzer(audit_log)
+    processor = RiskGuardedTransactionProcessor(analyzer)
+
+    clients = [
+        Client("Семён Персунов", date(1993, 5, 16), "+71234567890", ClientStatus.ACTIVE),
+        Client("Номад Горячев", date(1988, 10, 20), "+79998887766", ClientStatus.ACTIVE),
+        Client("Тимофей Куликов", date(2001, 3, 8), "+79261112233", ClientStatus.ACTIVE),
+        Client("Анна Смирнова", date(1995, 9, 1), "+79160001234", ClientStatus.ACTIVE),
+        Client("Игорь Волков", date(1979, 2, 14), "+79031234567", ClientStatus.ACTIVE),
+        Client("Ольга Иванова", date(2000, 7, 30), "+79179876543", ClientStatus.ACTIVE),
+    ]
+    for client in clients:
+        bank.add_client(client)
+
+    c1, c2, c3, c4, c5, c6 = clients
+
+    # обычные счета
+    acc_c1_main = bank.open_account(c1.client_id, Currency.RUB, Decimal("800000.00"))
+    acc_c1_usd = bank.open_account(c1.client_id, Currency.USD, Decimal("5000.00"))
+    acc_c3_main = bank.open_account(c3.client_id, Currency.RUB, Decimal("500000.00"))
+    acc_c4_usd = bank.open_account(c4.client_id, Currency.USD, Decimal("8000.00"))
+    acc_c4_eur = bank.open_account(c4.client_id, Currency.EUR, Decimal("3000.00"))
+    acc_c5_main = bank.open_account(c5.client_id, Currency.RUB, Decimal("150000.00"))
+    acc_c6_main = bank.open_account(c6.client_id, Currency.RUB, Decimal("80000.00"))
+    acc_c6_usd = bank.open_account(c6.client_id, Currency.USD, Decimal("2000.00"))
+
+    # специальные счета
+    acc_c2_premium = bank.open_premium_account(
+        c2.client_id, Currency.RUB, Decimal("300000.00"), Decimal("50000.00"), Decimal("100.00"))
+    acc_c3_savings = bank.open_savings_account(
+        c3.client_id, Currency.RUB, Decimal("200000.00"), Decimal("100000.00"), Decimal("0.5"))
+    acc_c5_savings = bank.open_savings_account(
+        c5.client_id, Currency.RUB, Decimal("120000.00"), Decimal("60000.00"), Decimal("0.8"))
+    acc_c6_invest = bank.open_investment_account(
+        c6.client_id, Currency.RUB, Decimal("100000.00"))
+
+    # замороженный и закрытый счета
+    acc_frozen_target = bank.open_account(c2.client_id, Currency.RUB, Decimal("5000.00"))
+    bank.freeze_account(acc_frozen_target.account_id)
+
+    acc_closing_target = bank.open_account(c2.client_id, Currency.RUB, Decimal("1000.00"))
+    acc_closing_target.withdraw(Decimal("1000.00"))
+    bank.close_account(acc_closing_target.account_id)
+
+    logger.info("Итого: клиентов=%s, счетов=%s, общий баланс банка=%s RUB",
+                len(bank.clients), len(bank.accounts), bank.get_total_balance())
+
+    # ------------------------------------------------------------------
+    # Помощник: создаёт транзакцию (она сама попадает в TRANSACTION_HISTORY)
+    # и кладёт её в очередь.
+    # Возвращает None, если транзакция отклонена уже на этапе создания.
+    # Приоритет назначается по порядку создания: чем раньше — тем выше,
+    # чтобы порядок обработки в очереди совпадал с порядком создания.
+    # created_at раскладывается в прошлое с шагом > 1 секунды, чтобы
+    # фактор FREQUENT_OPERATIONS не срабатывал между обычными транзакциями.
+    # ------------------------------------------------------------------
+    tx_counter = [0]
+
+    def submit_tx(
+            sender: BankAccount,
+            recipient: BankAccount,
+            amount: Decimal,
+            currency: Currency = Currency.RUB,
+            tx_type: TransactionType = TransactionType.INTERNAL,
+            created_at: datetime | None = None,
+            scheduled_at: datetime | None = None,
+    ) -> Transaction | None:
+        try:
+            tx = Transaction(
+                sender=sender,
+                recipient=recipient,
+                amount=amount,
+                currency=currency,
+                transaction_type=tx_type,
+                priority=1000 - tx_counter[0],
+                created_at=created_at if created_at is not None
+                else datetime.now() - timedelta(seconds=3 * tx_counter[0]),
+                scheduled_at=scheduled_at,
+            )
+        except BankAccountError as e:
+            logger.warning("❌ Транзакция отклонена при создании: %s", e)
+            return None
+
+        tx_counter[0] += 1
+        tx_queue.add_transaction(tx)
+        return tx
+
+
+    logger.info("\n== 2. Очередь: приоритеты, отложенные и отменённые операции ==")
+
+    # отложенная на час транзакция не берётся из очереди раньше времени
+    scheduled_tx = submit_tx(acc_c1_main, acc_c2_premium, Decimal("1000.00"),
+                             scheduled_at=datetime.now() + timedelta(hours=1))
+    logger.info("Отложенная транзакция %s в очереди, доступна к исполнению: %s",
+                scheduled_tx.transaction_id[-4:], tx_queue.get_next() is not None)
+
+    urgent_tx = submit_tx(acc_c1_main, acc_c6_main, Decimal("1500.00"))
+    regular_tx = submit_tx(acc_c1_usd, acc_c4_usd, Decimal("300.00"), Currency.USD)
+
+    next_available = tx_queue.get_next()
+    logger.info("Первая доступная к исполнению (высший приоритет): %s", next_available)
+
+    tx_queue.cancel_transaction(regular_tx.transaction_id)
+    logger.info("Отмена в очереди выполнена: статус %s, в очереди %s, доступно к исполнению %s",
+                regular_tx.status.value, tx_queue.pending_count, tx_queue.get_next() is not None)
+
+
+    logger.info("\n== 3. Основной поток транзакций ==")
+
+    normal_transfers = [  # (отправитель, получатель, сумма, валюта, тип)
+        (acc_c1_main, acc_c2_premium, "25000.00", Currency.RUB, TransactionType.INTERNAL),
+        (acc_c2_premium, acc_c3_main, "15000.00", Currency.RUB, TransactionType.INTERNAL),
+        (acc_c3_main, acc_c4_eur, "30000.00", Currency.RUB, TransactionType.INTERNAL),   # конвертация RUB → EUR
+        (acc_c4_usd, acc_c1_main, "200.00", Currency.USD, TransactionType.INTERNAL),     # конвертация USD → RUB
+        (acc_c5_main, acc_c6_main, "10000.00", Currency.RUB, TransactionType.INTERNAL),
+        (acc_c3_savings, acc_c3_main, "20000.00", Currency.RUB, TransactionType.INTERNAL),  # между своими счетами
+        (acc_c6_invest, acc_c6_main, "5000.00", Currency.RUB, TransactionType.INTERNAL),    # между своими счетами
+        (acc_c1_usd, acc_c4_usd, "500.00", Currency.USD, TransactionType.EXTERNAL),      # комиссия 1%
+        (acc_c1_main, acc_c6_main, "7500.00", Currency.RUB, TransactionType.EXTERNAL),
+        (acc_c5_savings, acc_c5_main, "5000.00", Currency.RUB, TransactionType.INTERNAL),
+        (acc_c2_premium, acc_c3_main, "5000.00", Currency.RUB, TransactionType.INTERNAL),   # повторный получатель
+        (acc_c3_main, acc_c1_main, "8000.00", Currency.RUB, TransactionType.INTERNAL),
+        (acc_c4_eur, acc_c1_main, "100.00", Currency.EUR, TransactionType.INTERNAL),        # конвертация EUR → RUB
+        (acc_c5_main, acc_c3_main, "20000.00", Currency.RUB, TransactionType.INTERNAL),
+        (acc_c6_main, acc_c6_usd, "7500.00", Currency.RUB, TransactionType.INTERNAL),       # конвертация RUB → USD
+    ]
+    for sender, recipient, amount, curr, tx_type in normal_transfers:
+        submit_tx(sender, recipient, Decimal(amount), curr, tx_type)
+
+
+    logger.info("\n== 4. Подозрительные операции (риск-анализ) ==")
+
+    # ночь (00:00–05:00) + крупная сумма + новый получатель → риск HIGH → блокировка
+    submit_tx(acc_c4_usd, acc_c4_eur, Decimal("6000.00"), Currency.USD,
+              created_at=datetime.combine(date.today(), time(1, 30)))
+
+    # ночь, но получатель уже проверен ранее → риск MEDIUM → исполнится под мониторингом
+    submit_tx(acc_c1_main, acc_c2_premium, Decimal("10000.00"), Currency.RUB,
+              created_at=datetime.combine(date.today(), time(2, 30)))
+
+    # крупная сумма проверенному получателю → риск MEDIUM → исполнится под мониторингом
+    submit_tx(acc_c1_main, acc_c2_premium, Decimal("600000.00"))
+
+    # серия переводов в коротком окне → у 3-й и 4-й фактор FREQUENT_OPERATIONS (MEDIUM)
+    series_time = datetime.now()
+    for _ in range(4):
+        submit_tx(acc_c3_main, acc_c1_main, Decimal("5000.00"), created_at=series_time)
+
+    # крупная сумма новому получателю днём → риск HIGH → блокировка
+    submit_tx(acc_c3_main, acc_c6_invest, Decimal("550000.00"))
+
+    # небольшой внешний перевод новому получателю → риск MEDIUM → исполнится
+    submit_tx(acc_c6_usd, acc_c4_usd, Decimal("100.00"), Currency.USD, TransactionType.EXTERNAL)
+
+
+    logger.info("\n== 5. Ошибочные операции ==")
+
+    logger.info("-- Отклоняются при создании --")
+    submit_tx(acc_c1_main, acc_c2_premium, Decimal("-500.00"))          # отрицательная сумма
+    submit_tx(acc_c1_usd, acc_c2_premium, Decimal("100.00"), Currency.RUB)  # валюта не совпадает со счётом отправителя
+
+    try:
+        acc_c1_main.deposit(25)                                        # пополнение не Decimal
+    except BankAccountError as e:
+        logger.info("❌ Пополнение отклонено: %s", e)
+
+    logger.info("-- Отклоняются при исполнении --")
+    submit_tx(acc_c6_main, acc_frozen_target, Decimal("7000.00"))      # получатель заморожен
+    submit_tx(acc_c6_main, acc_c1_main, Decimal("150000.00"))          # недостаточно средств
+    submit_tx(acc_c3_savings, acc_c5_savings, Decimal("150000.00"))    # ниже минимального остатка накопительного счёта
+    submit_tx(acc_c6_main, acc_closing_target, Decimal("500.00"))      # получатель закрыт
+
+
+    logger.info("\n== 6. Обработка очереди ==")
+    logger.info("Транзакций в очереди к исполнению: %s", tx_queue.pending_count)
+
+    executed_count = 0
+    rejected_count = 0
+    while True:
+        tx = tx_queue.get_next()
+        if tx is None:
+            break
+
+        logger.info("")
+        logger.info("Обработка -> %s", tx)
+        try:
+            processor.process_transaction(tx)  # сначала риск-анализ, затем исполнение (с повторными попытками)
+            executed_count += 1
+            logger.info("✅ Исполнена. Статус: %s, комиссия: %s %s",
+                        tx.status.value, tx.fee, tx.sender.currency.value)
+        except BankAccountError as e:
+            rejected_count += 1
+            logger.info("🚫 Отклонена: %s | Статус: %s | Причина: %s",
+                        e, tx.status.value, tx.failure_reason)
+
+    logger.info("Итог обработки: исполнено=%s, отклонено=%s", executed_count, rejected_count)
+
+    # в очереди осталась только отложенная на час транзакция — закрываем её отменой
+    logger.info("В очереди осталась отложенная транзакция: %s", scheduled_tx.transaction_id[-4:])
+    tx_queue.cancel_transaction(scheduled_tx.transaction_id)
+    logger.info("Отложенная транзакция отменена, очередь пуста: %s", tx_queue.pending_count)
+
+
+    logger.info("\n== 7. Пользовательские сценарии ==")
+
+    for client in (c1, c3):
+        logger.info("\n— 💳 Счета клиента %s —", client.name)
+        for account in bank.search_accounts(client_id=client.client_id):
+            logger.info(account.get_account_info())
+
+        client_history = history.get_by_client(client.client_id)
+        logger.info("\n— 📜 История транзакций клиента %s (%s шт.) —", client.name, len(client_history))
+        for tx in client_history:
+            logger.info("%s", tx)
+
+    logger.info("\n— ⚠️ Подозрительные операции —")
+    suspicious_entries = audit_log.get_suspicious_entries()
+    logger.info("Записей в аудит-журнале: %s", len(suspicious_entries))
+    for entry in suspicious_entries:
+        logger.info("  %s", entry)
+
+    logger.info("Флаги подозрительной активности по клиенту %s: %s", c1.name, c1.suspicious_activities)
+
+    # ------------------------------------------------------------------
+    # == 8. Отчёты
+    # ------------------------------------------------------------------
+    logger.info("\n== 8. Отчёты ==")
+
+    logger.info("\n— 🏆 Топ-3 клиентов по балансу —")
+    for rank, (client, total) in enumerate(bank.get_clients_ranking(top_n=3), start=1):
+        logger.info("%s место: %s — %s RUB", rank, client.name, total)
+
+    logger.info("\n— 📊 Статистика транзакций —")
+    stats = history.get_statistics()
+    logger.info("Всего транзакций: %s", stats["total"])
+    for status_name, count in stats["by_status"].items():
+        logger.info("  %s: %s", status_name, count)
+    logger.info("Отклонено (FAILED/CANCELLED): %s", stats["rejected"])
+    logger.info("Доля успешных: %s%%", stats["success_rate"])
+    for currency, volume in stats["completed_volume_by_currency"].items():
+        logger.info("  Объём исполненных %s: %s", currency.value, volume)
+    for currency, fees in stats["fees_by_currency"].items():
+        logger.info("  Собрано комиссий %s: %s", currency.value, fees)
+
+    logger.info("\n— 💎 Общий баланс банка —")
+    logger.info("%s RUB", bank.get_total_balance())
+
+
 if __name__ == "__main__":
     # run_tests_day1()
     # run_tests_day2()
     # run_tests_day3()
     # run_tests_day4()
-    run_tests_day5()
+    # run_tests_day5()
+    run_tests_day6()

@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_EVEN
 from enum import Enum, IntEnum
-from typing import Optional, Dict
+from typing import Optional, Dict, Iterable
 
 from dateutil.relativedelta import relativedelta
 
@@ -76,6 +76,8 @@ class Transaction:
 
         if self.scheduled_at is None:
             self.scheduled_at = self.created_at
+
+        TRANSACTION_HISTORY.record(self)
 
     def __str__(self) -> str:
         return (
@@ -255,26 +257,7 @@ class Client:
     ) -> Decimal:
         if rates is None:
             rates = DEFAULT_EXCHANGE_RATES
-
-        if target_currency not in rates:
-            raise InvalidOperationError(f"Target currency rate {target_currency.value} not found.")
-
-        target_rate = rates[target_currency]
-        total_in_base = Decimal("0.00")
-
-        for account in self.accounts:
-            if account.status == AccountStatus.CLOSED:
-                continue
-
-            if account.currency not in rates:
-                raise InvalidOperationError(f"Currency rate {account.currency.value} not found.")
-
-            acc_rate = rates[account.currency]
-            balance_in_base = account.balance * acc_rate
-            total_in_base += balance_in_base
-
-        total_in_target = total_in_base / target_rate
-        return total_in_target.quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
+        return summarize_balances(self.accounts, target_currency, rates)
 
     def __post_init__(self) -> None:
         if not self.is_adult:
@@ -392,15 +375,26 @@ class BankAccount(AbstractAccount):
         )
 
     def withdraw(self, amount: Decimal) -> None:
+        # шаблонный метод: общие проверки → проверка средств (хук наследника) → списание
+        self._validate_withdrawal(amount)
+        self._check_withdraw_funds(amount)
+        self._apply_withdrawal(amount)
+
+    def _validate_withdrawal(self, amount: Decimal) -> None:
         self._validate_status()
         self._validate_money_amount(amount, param_name="Withdrawal amount")
         self._validate_operation_safety(amount)
 
-        if self.balance < amount:
+    def _withdrawal_deduction(self, amount: Decimal) -> Decimal:
+        return amount
+
+    def _check_withdraw_funds(self, amount: Decimal) -> None:
+        if self.balance < self._withdrawal_deduction(amount):
             raise InsufficientFundsError(
                 f"Withdraw failed: insufficient balance {self.balance} {self.currency.value}")
 
-        self._balance -= amount
+    def _apply_withdrawal(self, amount: Decimal) -> None:
+        self._balance -= self._withdrawal_deduction(amount)
         logger.info(
             "Withdrawal successful: Account=%s, Amount=-%s %s, New Balance=%s %s",
             self.account_id[-4:], amount, self.currency.value, self.balance, self.currency.value
@@ -414,18 +408,24 @@ class BankAccount(AbstractAccount):
         )
 
     def process_outgoing_transfer(self, amount_with_fee: Decimal) -> None:
+        # шаблонный метод: проверка счёта → проверка средств (хук наследника) → списание
         self.validate_transaction(amount_with_fee)
+        self._check_transfer_funds(amount_with_fee)
+        self._balance -= amount_with_fee
+        logger.info(
+            "%s transfer sent: Account=%s, Amount=-%s %s, New Balance=%s %s",
+            self._TRANSFER_LOG_PREFIX, self.account_id[-4:], amount_with_fee, self.currency.value,
+            self.balance, self.currency.value
+        )
 
+    _TRANSFER_LOG_PREFIX: str = "Outgoing"
+
+    def _check_transfer_funds(self, amount_with_fee: Decimal) -> None:
+        """Хук: проверка достаточности средств перед исходящим переводом."""
         if self.balance < amount_with_fee:
             raise InsufficientFundsError(
                 f"Insufficient funds: balance {self.balance} {self.currency.value}, required {amount_with_fee}"
             )
-
-        self._balance -= amount_with_fee
-        logger.info(
-            "Outgoing transfer sent: Account=%s, Amount=-%s %s, New Balance=%s %s",
-            self.account_id[-4:], amount_with_fee, self.currency.value, self.balance, self.currency.value
-        )
 
     def get_account_info(self) -> str:
         return str(self)
@@ -435,6 +435,29 @@ class BankAccount(AbstractAccount):
             f"Type: {self.__class__.__name__} | Client: {self.client} | Account Number: {self.account_id[-4:]} | "
             f"Status: {self.status.name} | Balance: {self.balance} {self.currency.value}"
         )
+
+
+def summarize_balances(
+        accounts: Iterable[BankAccount],
+        target_currency: Currency,
+        rates: dict[Currency, Decimal],
+) -> Decimal:
+    if target_currency not in rates:
+        raise InvalidOperationError(f"Target currency rate {target_currency.value} not found.")
+
+    target_rate = rates[target_currency]
+    total_in_base = Decimal("0.00")
+
+    for account in accounts:
+        if account.status == AccountStatus.CLOSED:
+            continue
+
+        if account.currency not in rates:
+            raise InvalidOperationError(f"Currency rate {account.currency.value} not found.")
+
+        total_in_base += account.balance * rates[account.currency]
+
+    return (total_in_base / target_rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
 
 
 class Bank:
@@ -451,9 +474,7 @@ class Bank:
 
     def open_account(self, client_id: str, currency: Currency,
                      initial_balance: Decimal = Decimal("0.00")) -> BankAccount:
-        client = self._get_client(client_id)
-        if client.status == ClientStatus.BLOCKED:
-            raise InvalidOperationError("Client is blocked.")
+        client = self._get_client_for_opening(client_id)
 
         account = BankAccount(
             client=client,
@@ -461,9 +482,78 @@ class Bank:
             currency=currency,
             status=AccountStatus.ACTIVE
         )
+        return self._register_account(account)
+
+    def open_savings_account(
+            self,
+            client_id: str,
+            currency: Currency,
+            initial_balance: Decimal,
+            min_balance: Decimal,
+            monthly_rate: Decimal,
+    ) -> SavingsAccount:
+        client = self._get_client_for_opening(client_id)
+
+        account = SavingsAccount(
+            client=client,
+            balance=initial_balance,
+            currency=currency,
+            status=AccountStatus.ACTIVE,
+            min_balance=min_balance,
+            monthly_rate=monthly_rate,
+        )
+        return self._register_account(account)
+
+    def open_premium_account(
+            self,
+            client_id: str,
+            currency: Currency,
+            initial_balance: Decimal,
+            overdraft_limit: Decimal,
+            fixed_fee: Decimal,
+    ) -> PremiumAccount:
+        client = self._get_client_for_opening(client_id)
+
+        account = PremiumAccount(
+            client=client,
+            balance=initial_balance,
+            currency=currency,
+            status=AccountStatus.ACTIVE,
+            overdraft_limit=overdraft_limit,
+            fixed_fee=fixed_fee,
+        )
+        return self._register_account(account)
+
+    def open_investment_account(
+            self,
+            client_id: str,
+            currency: Currency,
+            initial_balance: Decimal = Decimal("0.00"),
+    ) -> InvestmentAccount:
+        client = self._get_client_for_opening(client_id)
+
+        account = InvestmentAccount(
+            client=client,
+            balance=initial_balance,
+            currency=currency,
+            status=AccountStatus.ACTIVE,
+        )
+        return self._register_account(account)
+
+    def _get_client_for_opening(self, client_id: str) -> Client:
+        client = self._get_client(client_id)
+        if client.status == ClientStatus.BLOCKED:
+            raise InvalidOperationError("Client is blocked.")
+        return client
+
+    def _register_account(self, account: BankAccount) -> BankAccount:
+        if account.account_id in self.accounts:
+            raise InvalidOperationError(f"Account {account.account_id} already registered.")
 
         self.accounts[account.account_id] = account
-        client.accounts.append(account)
+        account.client.accounts.append(account)
+        logger.info("Account %s (%s) registered for client %s.",
+                    account.account_id[-4:], account.__class__.__name__, account.client.name)
         return account
 
     def close_account(self, account_id: str) -> None:
@@ -541,26 +631,7 @@ class Bank:
     ) -> Decimal:
         if rates is None:
             rates = DEFAULT_EXCHANGE_RATES
-
-        if target_currency not in rates:
-            raise InvalidOperationError(f"Target currency rate {target_currency.value} not found.")
-
-        target_rate = rates[target_currency]
-        total_in_base = Decimal("0.00")
-
-        for account in self.accounts.values():
-            if account.status == AccountStatus.CLOSED:
-                continue
-
-            if account.currency not in rates:
-                raise InvalidOperationError(f"Currency rate {account.currency.value} not found.")
-
-            acc_rate = rates[account.currency]
-            balance_in_base = account.balance * acc_rate
-            total_in_base += balance_in_base
-
-        total_in_target = total_in_base / target_rate
-        return total_in_target.quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
+        return summarize_balances(self.accounts.values(), target_currency, rates)
 
     def get_clients_ranking(
             self,
@@ -619,35 +690,19 @@ class SavingsAccount(BankAccount):
                                          f"balance= {self.balance} {self.currency.value}, "
                                          f"min_balance= {min_balance} {self.currency.value}")
 
-    def withdraw(self, amount: Decimal) -> None:
-        self._validate_status()
-        self._validate_money_amount(amount, param_name="Withdrawal amount")
-        self._validate_operation_safety(amount)
-
+    def _check_withdraw_funds(self, amount: Decimal) -> None:
         if (self.balance - amount) < self.min_balance:
             raise InsufficientFundsError(f"Withdraw failed: remaining balance would drop below min balance "
                                          f"({self.min_balance} {self.currency.value})")
 
-        self._balance -= amount
-        logger.info(
-            "Withdrawal successful: Account=%s, Amount=-%s %s, New Balance=%s %s",
-            self.account_id[-4:], amount, self.currency.value, self.balance, self.currency.value
-        )
-
-    def process_outgoing_transfer(self, amount_with_fee: Decimal) -> None:
-        self.validate_transaction(amount_with_fee)
-
+    def _check_transfer_funds(self, amount_with_fee: Decimal) -> None:
         if (self.balance - amount_with_fee) < self.min_balance:
             raise InsufficientFundsError(
                 f"Savings transfer failed: remaining balance would drop below min balance "
                 f"({self.min_balance} {self.currency.value})"
             )
 
-        self._balance -= amount_with_fee
-        logger.info(
-            "Savings outgoing transfer sent: Account=%s, Amount=-%s %s, New Balance=%s %s",
-            self.account_id[-4:], amount_with_fee, self.currency.value, self.balance, self.currency.value
-        )
+    _TRANSFER_LOG_PREFIX: str = "Savings outgoing"
 
     def apply_monthly_interest(self) -> None:
         self._validate_status()
@@ -660,9 +715,6 @@ class SavingsAccount(BankAccount):
 
     def __str__(self) -> str:
         return super().__str__() + f" | Min Balance: {self.min_balance} {self.currency.value} | Monthly Rate: {self.monthly_rate}%"
-
-    def get_account_info(self) -> str:
-        return str(self)
 
 
 class PremiumAccount(BankAccount):
@@ -684,12 +736,13 @@ class PremiumAccount(BankAccount):
 
         super().__init__(client, balance, currency, status, account_id)
 
-    def withdraw(self, amount: Decimal) -> None:
-        self._validate_status()
-        self._validate_money_amount(amount, param_name="Withdrawal amount")
-        self._validate_operation_safety(amount)
+    _TRANSFER_LOG_PREFIX: str = "Premium outgoing"
 
-        total_deduction = amount + self.fixed_fee
+    def _withdrawal_deduction(self, amount: Decimal) -> Decimal:
+        return amount + self.fixed_fee
+
+    def _check_withdraw_funds(self, amount: Decimal) -> None:
+        total_deduction = self._withdrawal_deduction(amount)
         total_available_funds = self.balance + self.overdraft_limit
         account_currency = self.currency.value
         if total_available_funds < total_deduction:
@@ -697,34 +750,25 @@ class PremiumAccount(BankAccount):
                 f"Withdraw failed: total required ({total_deduction} {account_currency} incl. fee {self.fixed_fee} {account_currency})"
                 f" exceeds total available funds with overdraft ({total_available_funds} {account_currency})"
             )
-        self._balance -= total_deduction
+
+    def _apply_withdrawal(self, amount: Decimal) -> None:
+        self._balance -= self._withdrawal_deduction(amount)
         logger.info(
             "Premium withdrawal successful: Account=%s, Amount=%s %s, Fee=-%s %s, New Balance=%s %s",
-            self.account_id[-4:], amount, account_currency, self.fixed_fee, account_currency, self.balance,
-            account_currency
+            self.account_id[-4:], amount, self.currency.value, self.fixed_fee, self.currency.value,
+            self.balance, self.currency.value
         )
 
-    def process_outgoing_transfer(self, amount_with_fee: Decimal) -> None:
-        self.validate_transaction(amount_with_fee)
-
+    def _check_transfer_funds(self, amount_with_fee: Decimal) -> None:
         total_available = self.balance + self.overdraft_limit
         if total_available < amount_with_fee:
             raise InsufficientFundsError(
                 f"Premium account overdraft exceeded: available {total_available} {self.currency.value}, required {amount_with_fee}"
             )
 
-        self._balance -= amount_with_fee
-        logger.info(
-            "Premium outgoing transfer sent: Account=%s, Amount=-%s %s, New Balance=%s %s",
-            self.account_id[-4:], amount_with_fee, self.currency.value, self.balance, self.currency.value
-        )
-
     def __str__(self) -> str:
         return super().__str__() + (f" | Overdraft Limit: {self.overdraft_limit} {self.currency.value}"
                                     f" | Fixed Fee: {self.fixed_fee} {self.currency.value}")
-
-    def get_account_info(self) -> str:
-        return str(self)
 
 
 class AssetType(str, Enum):
@@ -759,9 +803,6 @@ class InvestmentAccount(BankAccount):
         }
 
         super().__init__(client, balance, currency, status, account_id)
-
-    def withdraw(self, amount: Decimal) -> None:
-        super().withdraw(amount)
 
     def buy_asset(self, asset_type: str | AssetType, amount: Decimal) -> None:
         self._validate_status()
@@ -808,9 +849,6 @@ class InvestmentAccount(BankAccount):
             for asset, amount in self.portfolio.items()
         )
         return super().__str__() + f" | Portfolio: [{portfolio_details}]"
-
-    def get_account_info(self) -> str:
-        return str(self)
 
 
 # ============================================================
@@ -983,7 +1021,7 @@ class RiskAssessment:
         factors_text = ", ".join(factor.value for factor in self.factors) or "no"
         return (
             f"risk {self.risk_level.name} ({self.risk_score}), "
-            f"factors: {factors_text}, operation {self.transaction.transaction_id[-4:]}"
+            f"factors: {factors_text}"
         )
 
 
@@ -1017,7 +1055,6 @@ class RiskProfile:
 
 class _ClientRiskHistory:
     def __init__(self) -> None:
-        self.transactions: list[Transaction] = []
         self.assessments: list[RiskAssessment] = []
         self.trusted_recipient_account_ids: set[str] = set()
 
@@ -1025,15 +1062,16 @@ class _ClientRiskHistory:
     def has_assessments(self) -> bool:
         return bool(self.assessments)
 
-    def record(self, transaction: Transaction, assessment: RiskAssessment) -> None:
-        self.transactions.append(transaction)
+    def record(self, assessment: RiskAssessment) -> None:
         self.assessments.append(assessment)
 
     def add_trusted_recipient(self, account_id: str) -> None:
         self.trusted_recipient_account_ids.add(account_id)
 
-    def count_transactions_since(self, moment: datetime) -> int:
-        return sum(1 for transaction in self.transactions if transaction.created_at >= moment)
+    def count_transactions_in_window(self, window_start: datetime, window_end: datetime) -> int:
+        # сами транзакции не хранятся а списком: они доступны через assessment.transaction
+        return sum(1 for assessment in self.assessments
+                   if window_start <= assessment.transaction.created_at <= window_end)
 
 
 class RiskAnalyzer:
@@ -1149,7 +1187,8 @@ class RiskAnalyzer:
 
     def _is_frequent(self, transaction: Transaction, history: Optional[_ClientRiskHistory]) -> bool:
         window_start = transaction.created_at - timedelta(seconds=self.FREQUENCY_WINDOW_SECONDS)
-        recent_count = history.count_transactions_since(window_start) if history else 0
+        recent_count = (history.count_transactions_in_window(window_start, transaction.created_at)
+                        if history else 0)
         return recent_count >= self.FREQUENCY_THRESHOLD
 
     @classmethod
@@ -1162,7 +1201,7 @@ class RiskAnalyzer:
 
     def _record(self, transaction: Transaction, assessment: RiskAssessment) -> None:
         client_id = transaction.sender.client.client_id
-        self._ensure_history(client_id).record(transaction, assessment)
+        self._ensure_history(client_id).record(assessment)
 
     def mark_recipient_as_trusted(self, transaction: Transaction) -> None:
         client_id = transaction.sender.client.client_id
@@ -1247,3 +1286,83 @@ class RiskGuardedTransactionProcessor(TransactionProcessor):
             client_id=transaction.sender.client.client_id,
             account_id=transaction.sender.account_id,
         )
+
+
+# ============================================================
+# Day 6: demonstration
+# ============================================================
+
+
+class TransactionHistory:
+
+    def __init__(self) -> None:
+        self._transactions: list[Transaction] = []
+
+    def record(self, transaction: Transaction) -> None:
+        self._transactions.append(transaction)
+
+    def get_by_client(self, client_id: str) -> list[Transaction]:
+        return [
+            tx for tx in self._transactions
+            if tx.sender.client.client_id == client_id
+               or tx.recipient.client.client_id == client_id
+        ]
+
+    def get_by_account(self, account_id: str) -> list[Transaction]:
+        return [
+            tx for tx in self._transactions
+            if tx.sender.account_id == account_id
+               or tx.recipient.account_id == account_id
+        ]
+
+    def get_by_status(self, status: TransactionStatus) -> list[Transaction]:
+        return [tx for tx in self._transactions if tx.status is status]
+
+    def get_statistics(self) -> dict[str, object]:
+        """Статистика транзакций: счётчики статусов, объём и комиссия по валютам."""
+        completed = self.get_by_status(TransactionStatus.COMPLETED)
+        rejected = (
+                self.get_by_status(TransactionStatus.FAILED)
+                + self.get_by_status(TransactionStatus.CANCELLED)
+        )
+
+        completed_volume_by_currency: dict[Currency, Decimal] = {}
+        fees_by_currency: dict[Currency, Decimal] = {}
+        for tx in completed:
+            completed_volume_by_currency[tx.currency] = (
+                    completed_volume_by_currency.get(tx.currency, Decimal("0.00")) + tx.amount
+            )
+            fees_by_currency[tx.currency] = (
+                    fees_by_currency.get(tx.currency, Decimal("0.00")) + tx.fee
+            )
+
+        if self._transactions:
+            success_rate = (Decimal(len(completed)) / Decimal(len(self._transactions))
+                            * Decimal("100")).quantize(
+                Decimal("0.1"), rounding=ROUND_HALF_EVEN
+            )
+        else:
+            success_rate = Decimal("0.0")
+
+        by_status = {
+            status.value: len(self.get_by_status(status))
+            for status in TransactionStatus
+        }
+
+        return {
+            "total": len(self._transactions),
+            "by_status": by_status,
+            "rejected": len(rejected),
+            "success_rate": success_rate,
+            "completed_volume_by_currency": completed_volume_by_currency,
+            "fees_by_currency": fees_by_currency,
+        }
+
+    def __len__(self) -> int:
+        return len(self._transactions)
+
+    def __iter__(self):
+        return iter(self._transactions)
+
+
+TRANSACTION_HISTORY = TransactionHistory()
