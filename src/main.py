@@ -1,4 +1,6 @@
 import logging
+import csv
+import json
 from datetime import date, time
 from time import sleep
 from decimal import Decimal
@@ -6,10 +8,12 @@ from unittest.mock import patch
 
 import models
 import utils
+import reports
 from exceptions import BankAccountError, NightOperationsForbiddenError
 from models import Client, BankAccount, AccountStatus, Currency, SavingsAccount, PremiumAccount, InvestmentAccount, \
     AssetType, ClientStatus, Bank, TransactionQueue, TransactionProcessor, TransactionType, Transaction, \
     AuditLog, AuditLogLevel, RiskAnalyzer, RiskGuardedTransactionProcessor, TransactionHistory, TRANSACTION_HISTORY
+from reports import ReportBuilder
 
 logging.basicConfig(
     level=logging.INFO,
@@ -760,10 +764,143 @@ def run_tests_day6() -> None:
     logger.info("%s RUB", bank.get_total_balance())
 
 
+def run_tests_day7() -> None:
+    logger.info("\n=== RUNNING DAY 7 TESTS: REPORTS & CHARTS ===")
+
+    logger.info("\n== 1. Подготовка данных ==")
+    bank = Bank("ZalupaBank")
+    tx_queue = TransactionQueue()
+    audit_log = AuditLog("reports-audit")
+    analyzer = RiskAnalyzer(audit_log)
+    processor = RiskGuardedTransactionProcessor(analyzer)
+
+    clients = [
+        Client("Семён Персунов", date(1993, 5, 16), "+71234567890", ClientStatus.ACTIVE),
+        Client("Анна Смирнова", date(1995, 9, 1), "+79160001234", ClientStatus.ACTIVE),
+        Client("Тимофей Куликов", date(2001, 3, 8), "+79261112233", ClientStatus.ACTIVE),
+    ]
+    for client in clients:
+        bank.add_client(client)
+
+    c1, c2, c3 = clients
+
+    acc_c1_main = bank.open_account(c1.client_id, Currency.RUB, Decimal("500000.00"))
+    acc_c1_usd = bank.open_account(c1.client_id, Currency.USD, Decimal("3000.00"))
+    acc_c2_main = bank.open_account(c2.client_id, Currency.RUB, Decimal("200000.00"))
+    acc_c2_eur = bank.open_account(c2.client_id, Currency.EUR, Decimal("1500.00"))
+    acc_c3_main = bank.open_account(c3.client_id, Currency.RUB, Decimal("80000.00"))
+    acc_c3_savings = bank.open_savings_account(
+        c3.client_id, Currency.RUB, Decimal("60000.00"), Decimal("30000.00"), Decimal("0.5"))
+
+    # замороженный счёт — перевод на него должен отклоняться
+    acc_frozen = bank.open_account(c2.client_id, Currency.RUB, Decimal("5000.00"))
+    bank.freeze_account(acc_frozen.account_id)
+
+    # Помощник: транзакция попадает в TRANSACTION_HISTORY сразу при создании,
+    # createdAt растягиваем в прошлое, чтобы FREQUENT_OPERATIONS не срабатывал впустую
+    tx_counter = [0]
+
+    def send(
+            sender: BankAccount,
+            recipient: BankAccount,
+            amount: str,
+            transaction_type: TransactionType = TransactionType.INTERNAL,
+            currency: Currency | None = None,
+    ) -> Transaction | None:
+        try:
+            tx = Transaction(
+                sender=sender,
+                recipient=recipient,
+                amount=Decimal(amount),
+                currency=currency if currency is not None else sender.currency,
+                transaction_type=transaction_type,
+                priority=1000 - tx_counter[0],
+                created_at=datetime.now() - timedelta(seconds=3 * tx_counter[0]),
+            )
+        except BankAccountError as e:
+            logger.warning("❌ Транзакция отклонена при создании: %s", e)
+            return None
+
+        tx_counter[0] += 1
+        tx_queue.add_transaction(tx)
+        return tx
+
+    cancelled_tx = send(acc_c2_main, acc_c1_main, "7000.00")
+    tx_queue.cancel_transaction(cancelled_tx.transaction_id)
+
+    send(acc_c1_main, acc_c2_main, "20000.00")                                        # обычный перевод
+    send(acc_c2_main, acc_c1_main, "8000.00")                                        # обратный перевод
+    send(acc_c1_usd, acc_c2_eur, "400.00", currency=Currency.USD)                     # конвертация USD → EUR
+    send(acc_c1_main, acc_c3_main, "15000.00")                                       # новому получателю
+    send(acc_c3_savings, acc_c3_main, "10000.00")                                    # между своими счетами
+    send(acc_c1_usd, acc_c2_main, "300.00", TransactionType.EXTERNAL, Currency.USD)  # комиссия 1%, USD → RUB
+    send(acc_c1_main, acc_c3_main, "600000.00")                                      # риск HIGH → блокировка
+    send(acc_c1_main, acc_frozen, "1000.00")                                         # получатель заморожен → отказ
+    send(acc_c3_main, acc_c1_main, "500000.00")                                      # недостаточно средств → отказ
+
+    logger.info("\n== 2. Обработка очереди ==")
+    while (tx := tx_queue.get_next()) is not None:
+        logger.info("Обработка -> %s", tx)
+        try:
+            processor.process_transaction(tx)
+            logger.info("✅ Исполнена. Статус: %s, комиссия: %s %s", tx.status.value, tx.fee, tx.sender.currency.value)
+        except BankAccountError as e:
+            logger.info("🚫 Отклонена: %s | статус: %s | причина: %s", e, tx.status.value, tx.failure_reason)
+
+    # ------------------------------------------------------------------
+    # == 3. Отчёты
+    # ------------------------------------------------------------------
+    builder = ReportBuilder(bank=bank, analyzer=analyzer)
+
+    logger.info("\n== 3. Отчёт по клиенту ==")
+    client_report = builder.build_client_report(c1)
+    logger.info("\n%s", client_report.to_text())
+
+    logger.info("\n== 4. Отчёт по банку ==")
+    bank_report = builder.build_bank_report()
+    logger.info("\n%s", bank_report.to_text())
+
+    logger.info("\n== 5. Отчёт по рискам ==")
+    risk_report = builder.build_risk_report()
+    logger.info("\n%s", risk_report.to_text())
+
+    # ------------------------------------------------------------------
+    # == 6. Экспорт JSON / CSV / текст
+    # ------------------------------------------------------------------
+    logger.info("\n== 6. Экспорт отчётов ==")
+    builder.export_to_json(client_report, "reports/client_report.json")
+    builder.export_to_csv(client_report, "reports/client_report.csv")
+    builder.export_to_json(bank_report, "reports/bank_report.json")
+    builder.export_to_csv(bank_report, "reports/bank_report.csv")
+    builder.export_to_json(risk_report, "reports/risk_report.json")
+    builder.export_to_csv(risk_report, "reports/risk_report.csv")
+    builder.export_to_text(bank_report, "reports/bank_report.txt")
+
+    with open("reports/client_report.json", encoding="utf-8") as f:
+        restored = json.load(f)
+    logger.info("Проверка: JSON читается обратно, разделов data: %s", len(restored["data"]))
+
+    # CSV читаем построчно, чтобы убедиться, что формат валиден
+    with open("reports/bank_report.csv", encoding="utf-8") as f:
+        csv_rows = list(csv.reader(f))
+    logger.info("Проверка: CSV читается обратно, строк (с заголовками): %s", len(csv_rows))
+
+    # ------------------------------------------------------------------
+    # == 7. Диаграммы
+    # ------------------------------------------------------------------
+    logger.info("\n== 7. Диаграммы ==")
+    charts = builder.save_charts(balance_client=c1)
+    for name, path in charts.items():
+        size = path.stat().st_size
+        logger.info("%s %s → %s (%s байт)", "✅" if size > 0 else "❌", name, path, size)
+
+
+
 if __name__ == "__main__":
     # run_tests_day1()
     # run_tests_day2()
     # run_tests_day3()
     # run_tests_day4()
     # run_tests_day5()
-    run_tests_day6()
+    # run_tests_day6()
+    run_tests_day7()

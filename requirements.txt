@@ -1,2 +1,3 @@
 shortuuid
 python-dateutil
+matplotlib

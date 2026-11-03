@@ -1,0 +1,46 @@
+{
+  "report_type": "client",
+  "title": "Отчёт по клиенту Семён Персунов",
+  "generated_at": "2026-11-02T16:34:15.338111",
+  "data": {
+    "клиент": "Семён Персунов (ID …y29v)",
+    "статус клиента": "ACTIVE",
+    "общий баланс (RUB)": "679730.00",
+    "счета": [
+      {
+        "счёт": "…Wq8T",
+        "тип": "BankAccount",
+        "валюта": "RUB",
+        "баланс": "473000.00",
+        "статус": "ACTIVE"
+      },
+      {
+        "счёт": "…3imE",
+        "тип": "BankAccount",
+        "валюта": "USD",
+        "баланс": "2297.00",
+        "статус": "ACTIVE"
+      }
+    ],
+    "транзакции клиента": {
+      "всего": 9,
+      "по статусам": {
+        "COMPLETED": 5,
+        "FAILED": 3,
+        "CANCELLED": 1
+      },
+      "объём исходящих": {
+        "RUB": "35000.00",
+        "USD": "700.00"
+      },
+      "объём входящих": {
+        "RUB": "8000.00"
+      },
+      "отклонённые": {
+        "8czU": "Insufficient funds: balance 473000.00 RUB, required 600000.00",
+        "Z3Th": "Operation prohibited: account is frozen",
+        "y7Ly": "Operation y7Ly blocked: risk level HIGH (5), reasons: large amount, new recipient"
+      }
+    }
+  }
+}
